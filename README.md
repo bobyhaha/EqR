@@ -250,5 +250,10 @@ for details.
 ## Citation
 
 ```bibtex
-TODO
+@article{huang2026equilibrium,
+  title={Equilibrium Reasoners: Learning Attractors Enables Scalable Reasoning},
+  author={Huang, Benhao and Geng, Zhengyang and Kolter, Zico},
+  journal={arXiv preprint arXiv:2605.21488},
+  year={2026}
+}
 ```

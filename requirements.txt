@@ -1,0 +1,26 @@
+# Core runtime
+torch>=2.0.0
+numpy
+pydantic
+omegaconf
+hydra-core
+wandb
+coolname
+psutil
+tqdm
+pyyaml
+argdantic
+colorama
+huggingface_hub
+adam-atan2
+flash_attn_3
+
+# Analysis and evaluation plots
+matplotlib
+plotly
+pandas
+scipy
+scikit-learn
+
+# Testing
+pytest

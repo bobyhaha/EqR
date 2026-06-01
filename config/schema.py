@@ -72,6 +72,7 @@ class PretrainConfig(pydantic.BaseModel):
     train_epochs_per_iter: Optional[int] = None
     eval_interval_steps: Optional[int] = None
     eval_save_outputs: List[str] = []
+    eval_save_carry: bool = False
     heavy_metrics_log_interval: Optional[int] = 100
     steps_hist_log_interval_steps: Optional[int] = 100
     steps_hist_plotly: bool = True

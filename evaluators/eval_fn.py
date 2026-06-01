@@ -407,8 +407,10 @@ def evaluate(
 
     if config.eval_dir is not None:
         os.makedirs(config.eval_dir, exist_ok=True)
-        torch.save({k: torch.cat(v, dim=0) for k, v in save_preds.items()}, os.path.join(config.eval_dir, f"all_preds.{rank}"))
-        torch.save(carry, os.path.join(config.eval_dir, f"final_carry.{rank}"))
+        if save_preds:
+            torch.save({k: torch.cat(v, dim=0) for k, v in save_preds.items()}, os.path.join(config.eval_dir, f"all_preds.{rank}"))
+        if config.eval_save_carry:
+            torch.save(carry, os.path.join(config.eval_dir, f"final_carry.{rank}"))
         if rank == 0:
             OmegaConf.save(config=OmegaConf.create(config.model_dump()), f=os.path.join(config.eval_dir, "eval_config.yaml"))
 

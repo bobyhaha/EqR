@@ -120,10 +120,13 @@ def _base_config(eval_cfg: EvalConfig, ckpt: Dict[str, Any], ckpt_path: str, ran
     config = PretrainConfig(**cfg)
     config.checkpoint_path = str(Path(ckpt_path).parent)
     config.eval_save_outputs = eval_cfg.save_outputs
+    config.eval_save_carry = eval_cfg.save_carry
     if eval_cfg.loss_head_name:
         config.arch.loss.name = eval_cfg.loss_head_name
     if eval_cfg.global_batch_size is not None:
         config.global_batch_size = eval_cfg.global_batch_size
+    if eval_cfg.seed is not None:
+        config.seed = int(eval_cfg.seed)
     if eval_cfg.dataset_data_path:
         config.dataset.data_path = str(eval_cfg.dataset_data_path)
     if eval_cfg.load_strict is not None:
@@ -171,6 +174,34 @@ def _setup_random_reset_carry(model: Any, reset_std: float, rank: int) -> None:
         return replace(carry, z_H=z_h, z_L=z_l)
 
     inner.reset_carry = random_reset.__get__(inner, type(inner))
+
+
+def _apply_runtime_arch_overrides(model: Any, overrides: Dict[str, Any], rank: int) -> None:
+    arch_overrides = {k.removeprefix("arch."): v for k, v in overrides.items() if k.startswith("arch.")}
+    if not arch_overrides:
+        return
+    inner = _unwrap_inner(model)
+    if inner is None:
+        return
+
+    if "noise_scale" in arch_overrides:
+        value = float(arch_overrides["noise_scale"])
+        applied = False
+        for module in inner.modules():
+            if hasattr(module, "noise_scale"):
+                setattr(module, "noise_scale", value)
+                applied = True
+        if rank == 0 and applied:
+            rank_zero_print_info(f"runtime arch.noise_scale={value}")
+
+    stds = getattr(inner, "_random_reset_field_stds", None)
+    if isinstance(stds, dict):
+        if "H_init_std" in arch_overrides:
+            stds["z_H"] = float(arch_overrides["H_init_std"])
+        if "L_init_std" in arch_overrides:
+            stds["z_L"] = float(arch_overrides["L_init_std"])
+        if rank == 0 and any(k in arch_overrides for k in ("H_init_std", "L_init_std")):
+            rank_zero_print_info(f"runtime reset stds={stds}")
 
 
 def _summarize(metrics: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -233,6 +264,7 @@ def _run_checkpoint(eval_cfg: EvalConfig, ckpt_cfg: CheckpointEvalConfig, rank: 
         _apply_overrides(run_config, combo, rank=rank)
         loss_head = getattr(train_state_eval.model, "_orig_mod", train_state_eval.model)
         _apply_overrides(loss_head.model.config, {k.removeprefix("arch."): v for k, v in combo.items() if k.startswith("arch.")}, rank=rank)
+        _apply_runtime_arch_overrides(train_state_eval.model, combo, rank)
         _seed(run_config.seed, rank)
         if eval_cfg.different_init and eval_cfg.different_init > 1:
             _setup_random_reset_carry(train_state_eval.model, eval_cfg.different_init_reset_std, rank)

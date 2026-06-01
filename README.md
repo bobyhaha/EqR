@@ -233,9 +233,59 @@ Evaluation config:
 config/eval/depth_breadth.yaml
 ```
 
-## TODO
+### Reproduce Sudoku results
 
-- Release XLA code for large-scale inference.
+The Sudoku results in the paper use depth 64, breadth 128, convergence-based
+top-4 selection, Langevin noise scale 0.5, and latent reset scale 1.0. Use the
+dedicated configs below for the released Sudoku checkpoint.
+
+Quick 2048-sample smoke eval:
+
+```bash
+python evaluate.py \
+  eval_yaml=config/eval/sudoku_lite_noise05.yaml \
+  checkpoint=downloaded_checkpoints/sudoku-extreme/eqr.pth
+```
+
+This runs `global_batch_size=128` for `max_eval_steps=16` and is intended as a
+fast sanity check before launching the full evaluation. Over 5 seeds, this took
+about 40 minutes on 2 80GB GPUs and gave:
+
+| Metric | Mean +/- std |
+| --- | ---: |
+| `convergence_top_k/cumulative_exact_acc_top1` | 99.19 +/- 0.12 |
+| `convergence_top_k/exact_accuracy` | 98.60 +/- 0.04 |
+| `majority_vote/exact_accuracy` | 98.67 +/- 0.05 |
+| `different_init/any_correct` | 99.20 +/- 0.10 |
+
+To reproduce the smoke-eval standard deviation, repeat the same command with
+`seed=<n>` and a unique `suffix=...` for each run.
+
+Full paper-scale eval (400k+ eval samples):
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node 8 evaluate.py \
+  eval_yaml=config/eval/sudoku_full_noise05.yaml \
+  checkpoint=downloaded_checkpoints/sudoku-extreme/eqr.pth
+```
+
+For the full paper-scale run, keep `global_batch_size=768` and breadth 128.
+With 8 GPUs, this is 96 examples per GPU per eval step. For multi-node Slurm
+launches, pass the same `evaluate.py` arguments to your distributed launcher.
+Our 8-GPU reference run used about 55 GiB per GPU and took about 33.6 hours;
+a 16-GPU run took about 17 hours. The 8-GPU run produced:
+
+| Metric | Value |
+| --- | ---: |
+| `convergence_top_k/cumulative_exact_acc_top1` | 99.7902 |
+| `convergence_top_k/exact_accuracy` | 99.5570 |
+| `majority_vote/exact_accuracy` | 99.5973 |
+| `different_init/any_correct` | 99.7984 |
+
+The metrics are percentages. The smoke-eval standard deviation is the sample
+standard deviation across seeds over 2048 examples per run. The full result
+above was evaluated over 423,168 total examples from the released
+Sudoku-Extreme checkpoint.
 
 ## Acknowledgements
 

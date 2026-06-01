@@ -22,12 +22,14 @@ class EvalConfig(pydantic.BaseModel):
     checkpoint: Optional[str] = None
     checkpoint_list: List[CheckpointEvalConfig] = Field(default_factory=list)
     global_batch_size: Optional[int] = None
+    seed: Optional[int] = None
     dataset_data_path: Optional[str] = None
     load_strict: Optional[bool] = None
     top_k: Optional[Union[int, List[int]]] = None
     eval_yaml: Optional[str] = Field(default=None, alias="eval_config")
     suffix: Optional[str] = None
-    save_outputs: List[str] = Field(default_factory=lambda: ["inputs", "labels", "puzzle_identifiers", "logits"])
+    save_outputs: List[str] = Field(default_factory=list)
+    save_carry: bool = False
     param_iter: Dict[str, Any] = Field(default_factory=dict)
     shared_param_iter: Dict[str, Any] = Field(default_factory=dict)
     description: Optional[str] = None

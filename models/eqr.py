@@ -8,6 +8,7 @@ from torch import nn
 
 from models.common import trunc_normal_init_
 from models.layers import Attention, CastedEmbedding, CastedLinear, CosSin, RotaryEmbedding, RotaryEmbedding2D, SwiGLU, rms_norm
+from models.sparse_embedding import CastedSparseEmbedding
 
 
 @dataclass
@@ -31,6 +32,8 @@ class ModelCarry:
 class EqRConfig(BaseModel):
     batch_size: int
     seq_len: int
+    input_seq_len: Optional[int] = None
+    num_puzzle_identifiers: int = 1
     vocab_size: int
     H_cycles: int
     L_cycles: int
@@ -48,6 +51,8 @@ class EqRConfig(BaseModel):
     halt_exploration_prob: float
     forward_dtype: str = "bfloat16"
     mlp_t: bool = False
+    puzzle_emb_len: int = 0
+    puzzle_emb_ndim: int = 0
     lambda_: float = 0.95
     noise_scale: float = 0.01
     H_init_std: float = 1.0
@@ -111,6 +116,14 @@ class InnerNetwork(nn.Module):
         self.embed_scale = math.sqrt(config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
         self.embed_tokens = CastedEmbedding(config.vocab_size, config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        if config.puzzle_emb_len > 0:
+            self.puzzle_emb = CastedSparseEmbedding(
+                config.num_puzzle_identifiers,
+                config.puzzle_emb_ndim,
+                batch_size=config.batch_size,
+                init_std=0,
+                cast_to=self.forward_dtype,
+            )
         self.lm_head = CastedLinear(config.hidden_size, config.vocab_size, bias=False)
         self.q_head = CastedLinear(config.hidden_size, 2, bias=True)
 
@@ -144,8 +157,16 @@ class InnerNetwork(nn.Module):
     def _cos_sin(self) -> CosSin:
         return self.rotary_emb() if hasattr(self, "rotary_emb") else None
 
-    def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_scale * self.embed_tokens(input_ids.to(torch.int32))
+    def _input_embeddings(self, input_ids: torch.Tensor, puzzle_identifiers: torch.Tensor) -> torch.Tensor:
+        embeddings = self.embed_tokens(input_ids.to(torch.int32))
+        if self.config.puzzle_emb_len > 0:
+            puzzle_embedding = self.puzzle_emb(puzzle_identifiers.to(torch.int32))
+            padded = self.config.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            if padded > 0:
+                puzzle_embedding = torch.nn.functional.pad(puzzle_embedding, (0, padded))
+            puzzle_embedding = puzzle_embedding.view(-1, self.config.puzzle_emb_len, self.config.hidden_size)
+            embeddings = torch.cat((puzzle_embedding, embeddings), dim=1)
+        return self.embed_scale * embeddings
 
     def empty_carry(self, batch_size: int, device: Optional[torch.device] = None) -> LatentCarry:
         shape = (batch_size, self.config.seq_len, self.config.hidden_size)
@@ -187,10 +208,10 @@ class InnerNetwork(nn.Module):
         z_H, z_L = self.deep_recursion(
             carry.z_H,
             carry.z_L,
-            self._input_embeddings(batch["inputs"]),
+            self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"]),
             {"cos_sin": self._cos_sin()},
         )
-        logits = self.lm_head(z_H).contiguous()
+        logits = self.lm_head(z_H[:, self.config.puzzle_emb_len :]).contiguous()
         q = self.q_head(z_H[:, 0]).to(torch.float32)
         return LatentCarry(z_H=z_H.detach(), z_L=z_L.detach()), logits, q[..., 0]
 
@@ -225,6 +246,16 @@ def _reset_rows(
 class EqRModel(nn.Module):
     def __init__(self, config_dict: dict) -> None:
         super().__init__()
+        config_dict = dict(config_dict)
+        puzzle_emb_ndim = int(config_dict.get("puzzle_emb_ndim", 0) or 0)
+        puzzle_emb_len = int(config_dict.get("puzzle_emb_len", 0) or 0)
+        if puzzle_emb_ndim > 0 and puzzle_emb_len <= 0:
+            hidden_size = int(config_dict["hidden_size"])
+            puzzle_emb_len = -(puzzle_emb_ndim // -hidden_size)
+            config_dict["puzzle_emb_len"] = puzzle_emb_len
+        if puzzle_emb_len > 0 and config_dict.get("input_seq_len") is None:
+            config_dict["input_seq_len"] = config_dict["seq_len"]
+            config_dict["seq_len"] = int(config_dict["seq_len"]) + puzzle_emb_len
         self.config = EqRConfig(**config_dict)
         self.inner = InnerNetwork(self.config)
 

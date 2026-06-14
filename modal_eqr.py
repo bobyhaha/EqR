@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Optional
 
@@ -275,6 +276,28 @@ def train_all_8gpu(max_steps: Optional[int] = None, disable_compile: bool = Fals
     return {"status": "ok", "configs": SUDOKU_CONFIGS, "gpus": 8, "results_volume": RESULTS_VOLUME}
 
 
+@app.function(
+    image=image,
+    timeout=60 * 30,
+    volumes={"/outputs": results_volume},
+)
+def pack_results(archive_name: str = "eqr_modal_outputs.tar.gz") -> dict[str, str]:
+    src = Path("/outputs/outputs")
+    dst = Path("/outputs") / archive_name
+    if not src.exists():
+        raise FileNotFoundError(str(src))
+    if dst.exists():
+        dst.unlink()
+    with tarfile.open(dst, "w:gz") as tar:
+        tar.add(src, arcname="outputs")
+    results_volume.commit()
+    return {
+        "status": "ok",
+        "archive": archive_name,
+        "download": f"modal volume get {RESULTS_VOLUME} {archive_name} ./{archive_name}",
+    }
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "smoke",
@@ -286,12 +309,14 @@ def main(
         result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile)
     elif mode == "all8":
         result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile)
+    elif mode in {"pack", "pack-results"}:
+        result = pack_results.remote()
     elif mode == "smoke":
         result = smoke.remote(config=config)
     elif mode == "train":
         result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile)
     else:
-        raise ValueError("mode must be one of: smoke, train, all, all8")
+        raise ValueError("mode must be one of: smoke, train, all, all8, pack")
 
     print(result)
     print()

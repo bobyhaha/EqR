@@ -117,3 +117,9 @@ dmypy.json
 *.ckpt
 
 downloaded_checkpoints/
+
+# Modal result downloads/archives
+modal_outputs/
+modal_outputs_*/
+eqr_modal_outputs*.tar.gz
+modal_results_summary.csv

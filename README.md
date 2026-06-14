@@ -242,6 +242,48 @@ Run the full Sudoku comparison:
 bash scripts/run_sudoku_lg_prm_experiment.sh
 ```
 
+### Modal GPU Runs
+
+From this `EqR_Modified/` directory:
+
+```bash
+python -m pip install modal
+modal setup
+```
+
+Run a remote H100 smoke test. This builds the Modal image, checks CUDA,
+downloads/caches Sudoku data, and runs two training steps:
+
+```bash
+modal run modal_eqr.py --mode smoke --config lg_prm_noisy_soft_sudoku
+```
+
+Train one config on Modal:
+
+```bash
+modal run modal_eqr.py --mode train --config lg_prm_noisy_soft_sudoku
+```
+
+Train the full Sudoku comparison on Modal:
+
+```bash
+modal run modal_eqr.py --mode all
+```
+
+For a short remote training test, cap steps explicitly:
+
+```bash
+modal run modal_eqr.py --mode train --config lg_prm_noisy_soft_sudoku --max-steps 100
+```
+
+Modal outputs are persisted in the `eqr-lg-prm-results` Volume. List and
+download them with:
+
+```bash
+modal volume ls eqr-lg-prm-results outputs
+modal volume get eqr-lg-prm-results outputs ./modal_outputs
+```
+
 ## Evaluation
 
 `scripts/eval.sh` uses `config/eval/depth_breadth.yaml`. By default it runs

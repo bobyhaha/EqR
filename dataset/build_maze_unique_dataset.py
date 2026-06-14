@@ -10,7 +10,10 @@ from argdantic import ArgParser
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from common import PuzzleDatasetMetadata
+try:
+    from dataset.common import PuzzleDatasetMetadata
+except ImportError:
+    from common import PuzzleDatasetMetadata
 
 
 CHARSET = "# SGo"
@@ -40,6 +43,7 @@ class DataProcessConfig(BaseModel):
 
     strict_length: bool = True
     require_unique: bool = False
+    require_multiple: bool = False
     max_length_resamples: int = 50
     max_grid_attempts: int = 200
     max_start_attempts: int = 200
@@ -234,6 +238,7 @@ def _generate_single_sample(
     max_grid_attempts: int,
     max_start_attempts: int,
     require_unique: bool,
+    require_multiple: bool,
     maze_mode: str,
 ) -> Optional[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int], List[Tuple[int, int]]]]:
     mode = maze_mode.lower()
@@ -264,6 +269,10 @@ def _generate_single_sample(
             if require_unique and mode != "perfect":
                 count = _shortest_path_count_cap(open_mask, start, goal, cap=2)
                 if count != 1:
+                    continue
+            if require_multiple:
+                count = _shortest_path_count_cap(open_mask, start, goal, cap=2)
+                if count < 2:
                     continue
             return open_mask, start, goal, path
     return None
@@ -317,6 +326,7 @@ def _build_split(
                     config.max_grid_attempts,
                     config.max_start_attempts,
                     config.require_unique,
+                    config.require_multiple,
                     config.maze_mode,
                 )
                 if sample is None:
@@ -402,6 +412,10 @@ def preprocess_data(config: DataProcessConfig):
         raise ValueError("wall_prob must be in [0, 1)")
     if config.train_samples <= 0 or config.test_samples <= 0:
         raise ValueError("train_samples and test_samples must be > 0")
+    if config.require_unique and config.require_multiple:
+        raise ValueError("require_unique and require_multiple cannot both be true")
+    if config.require_multiple and config.maze_mode.lower() == "perfect":
+        raise ValueError("perfect mazes have a unique path; use maze_mode=random for multiple-solution data")
 
     rng = np.random.default_rng(config.seed)
 
@@ -416,6 +430,8 @@ def preprocess_data(config: DataProcessConfig):
 
     with open(os.path.join(config.output_dir, "identifiers.json"), "w") as f:
         json.dump(["<blank>"], f)
+    with open(os.path.join(config.output_dir, "generation_config.json"), "w") as f:
+        json.dump(config.model_dump(), f, indent=2)
 
 
 if __name__ == "__main__":

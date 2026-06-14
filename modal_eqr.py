@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import tarfile
 from pathlib import Path
@@ -35,6 +36,29 @@ SUDOKU_CONFIGS = [
     "lg_prm_noisy_soft_sudoku",
     "lg_prm_no_library_sudoku",
 ]
+
+MAZE_UNIQUE_CONFIGS = [
+    "eqr_maze_unique",
+    "trm_maze_unique",
+    "lg_prm_hard_maze_unique",
+    "lg_prm_soft_maze_unique",
+    "lg_prm_noisy_hard_maze_unique",
+    "lg_prm_noisy_soft_maze_unique",
+    "lg_prm_no_library_maze_unique",
+]
+
+MAZE_MULTI_CONFIGS = [
+    "eqr_maze_multi",
+    "trm_maze_multi",
+    "lg_prm_hard_maze_multi",
+    "lg_prm_soft_maze_multi",
+    "lg_prm_noisy_hard_maze_multi",
+    "lg_prm_noisy_soft_maze_multi",
+    "lg_prm_no_library_maze_multi",
+]
+
+MAZE_CONFIGS = MAZE_UNIQUE_CONFIGS + MAZE_MULTI_CONFIGS
+ALL_CONFIGS = SUDOKU_CONFIGS + MAZE_CONFIGS
 
 
 app = modal.App(APP_NAME)
@@ -106,6 +130,10 @@ image = (
             "downloads",
             "downloaded_checkpoints",
             "outputs",
+            "modal_outputs",
+            "modal_outputs_*",
+            "eqr_modal_outputs*.tar.gz",
+            "modal_results_summary.csv",
             "wandb",
             ".venv",
         ],
@@ -141,14 +169,79 @@ def _ensure_sudoku_data() -> None:
     data_volume.commit()
 
 
-def _train_overrides(max_steps: Optional[int], smoke: bool, disable_compile: bool) -> list[str]:
+def _split_has_samples(dataset_root: Path, split: str, min_samples: int) -> bool:
+    metadata_path = dataset_root / split / "dataset.json"
+    if not metadata_path.exists():
+        return False
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    return int(metadata.get("total_samples", 0)) >= min_samples
+
+
+def _maze_dataset_ready(dataset_root: Path, min_samples: int) -> bool:
+    return _split_has_samples(dataset_root, "train", min_samples) and _split_has_samples(dataset_root, "test", min_samples)
+
+
+def _ensure_maze_data(which: str = "both", *, smoke: bool = False) -> None:
+    expected_unique = Path(REMOTE_REPO) / "data" / "maze-30x30-unique-1k"
+    expected_multi = Path(REMOTE_REPO) / "data" / "maze-30x30-multi-1k"
+    expected = {"unique": expected_unique, "multi": expected_multi}
+    if which not in {"unique", "multi", "both"}:
+        raise ValueError(f"unknown maze dataset selector: {which}")
+
+    required = list(expected.values()) if which == "both" else [expected[which]]
+    min_samples = 4 if smoke else 1000
+    if all(_maze_dataset_ready(path, min_samples) for path in required):
+        print(f"Maze data already present for {which}: {', '.join(map(str, required))}", flush=True)
+        return
+
+    cmd = ["python", "scripts/build_maze_datasets.py", "--which", which]
+    if smoke:
+        cmd.extend(["--train-samples", "4", "--test-samples", "4"])
+    _run(cmd)
+    data_volume.commit()
+
+
+def _ensure_data_for_config(config: str, *, smoke: bool = False) -> None:
+    if "sudoku" in config:
+        _ensure_sudoku_data()
+    elif "maze_unique" in config:
+        _ensure_maze_data("unique", smoke=smoke)
+    elif "maze_multi" in config:
+        _ensure_maze_data("multi", smoke=smoke)
+    elif "maze" in config:
+        _ensure_maze_data("both", smoke=smoke)
+    else:
+        raise ValueError(f"Cannot infer dataset for config: {config}")
+
+
+def _configs_from(configs: list[str], start_config: Optional[str]) -> list[str]:
+    if not start_config:
+        return configs
+    if start_config not in configs:
+        raise ValueError(f"start_config={start_config!r} is not in this run list: {configs}")
+    return configs[configs.index(start_config):]
+
+
+def _train_overrides(
+    max_steps: Optional[int],
+    smoke: bool,
+    disable_compile: bool,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> list[str]:
     overrides = ["++wandb_mode=offline"]
+    if experiment_name:
+        overrides.append(f"++project_name={experiment_name}")
     if max_steps is not None:
         overrides.append(f"++max_steps={max_steps}")
+    if skip_eval:
+        overrides.append("++eval_interval_steps=null")
     if smoke:
         overrides.extend(
             [
-                "++max_steps=2",
+                "++max_steps=1",
+                "++global_batch_size=4",
                 "++eval_interval_steps=null",
                 "++checkpoint_interval_steps=null",
                 "++heavy_metrics_log_interval=null",
@@ -187,13 +280,14 @@ def smoke(config: str = "lg_prm_noisy_soft_sudoku") -> dict[str, str]:
                 "models/lg_prm.py",
                 "utils/wandb.py",
                 "utils/checkpoint.py",
+                "scripts/build_maze_datasets.py",
                 "scripts/print_model_params.py",
             ]
         )
         _run(["python", "-c", "import exceptiongroup, adam_atan2; print('deps ok')"])
         _run(["python", "scripts/print_model_params.py", config])
 
-        _ensure_sudoku_data()
+        _ensure_data_for_config(config, smoke=True)
         _run(
             ["bash", "scripts/train.sh", config, *_train_overrides(None, smoke=True, disable_compile=True)],
             env={"DISABLE_COMPILE": "1"},
@@ -216,16 +310,60 @@ def train_config(
     config: str,
     max_steps: Optional[int] = None,
     disable_compile: bool = False,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
 ) -> dict[str, str]:
     try:
         _run(["nvidia-smi"])
         _run(["python", "scripts/print_model_params.py", config])
-        _ensure_sudoku_data()
+        _ensure_data_for_config(config)
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-        _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
+        _run(
+            [
+                "bash",
+                "scripts/train.sh",
+                config,
+                *_train_overrides(
+                    max_steps,
+                    smoke=False,
+                    disable_compile=disable_compile,
+                    skip_eval=skip_eval,
+                    experiment_name=experiment_name,
+                ),
+            ],
+            env=env,
+        )
     finally:
         _commit_volumes()
     return {"status": "ok", "config": config, "results_volume": RESULTS_VOLUME}
+
+
+def _train_configs(
+    configs: list[str],
+    max_steps: Optional[int],
+    disable_compile: bool,
+    env: Optional[dict[str, str]],
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> None:
+    for config in configs:
+        _ensure_data_for_config(config)
+        _run(
+            [
+                "bash",
+                "scripts/train.sh",
+                config,
+                *_train_overrides(
+                    max_steps,
+                    smoke=False,
+                    disable_compile=disable_compile,
+                    skip_eval=skip_eval,
+                    experiment_name=experiment_name,
+                ),
+            ],
+            env=env,
+        )
+        _commit_volumes()
 
 
 @app.function(
@@ -237,18 +375,76 @@ def train_config(
         f"{REMOTE_REPO}/data": data_volume,
     },
 )
-def train_all(max_steps: Optional[int] = None, disable_compile: bool = False) -> dict[str, object]:
+def train_all(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(SUDOKU_CONFIGS, start_config)
     try:
         _run(["nvidia-smi"])
-        _run(["python", "scripts/print_model_params.py"])
-        _ensure_sudoku_data()
+        _run(["python", "scripts/print_model_params.py", *configs])
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-        for config in SUDOKU_CONFIGS:
-            _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
-            _commit_volumes()
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
     finally:
         _commit_volumes()
-    return {"status": "ok", "configs": SUDOKU_CONFIGS, "results_volume": RESULTS_VOLUME}
+    return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_maze(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(MAZE_CONFIGS, start_config)
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", *configs])
+        env = {"DISABLE_COMPILE": "1"} if disable_compile else None
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_all_datasets(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(ALL_CONFIGS, start_config)
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", *configs])
+        env = {"DISABLE_COMPILE": "1"} if disable_compile else None
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
 
 
 @app.function(
@@ -260,20 +456,82 @@ def train_all(max_steps: Optional[int] = None, disable_compile: bool = False) ->
         f"{REMOTE_REPO}/data": data_volume,
     },
 )
-def train_all_8gpu(max_steps: Optional[int] = None, disable_compile: bool = False) -> dict[str, object]:
+def train_all_8gpu(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(SUDOKU_CONFIGS, start_config)
     try:
         _run(["nvidia-smi"])
-        _run(["python", "scripts/print_model_params.py"])
-        _ensure_sudoku_data()
+        _run(["python", "scripts/print_model_params.py", *configs])
         env = {"NPROC_PER_NODE": "8"}
         if disable_compile:
             env["DISABLE_COMPILE"] = "1"
-        for config in SUDOKU_CONFIGS:
-            _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
-            _commit_volumes()
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
     finally:
         _commit_volumes()
-    return {"status": "ok", "configs": SUDOKU_CONFIGS, "gpus": 8, "results_volume": RESULTS_VOLUME}
+    return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU8_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_maze_8gpu(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(MAZE_CONFIGS, start_config)
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", *configs])
+        env = {"NPROC_PER_NODE": "8"}
+        if disable_compile:
+            env["DISABLE_COMPILE"] = "1"
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU8_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_all_datasets_8gpu(
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+) -> dict[str, object]:
+    configs = _configs_from(ALL_CONFIGS, start_config)
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", *configs])
+        env = {"NPROC_PER_NODE": "8"}
+        if disable_compile:
+            env["DISABLE_COMPILE"] = "1"
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
 
 
 @app.function(
@@ -304,19 +562,30 @@ def main(
     config: str = "lg_prm_noisy_soft_sudoku",
     max_steps: Optional[int] = None,
     disable_compile: bool = False,
+    start_config: Optional[str] = None,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
 ) -> None:
     if mode == "all":
-        result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile)
+        result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
     elif mode == "all8":
-        result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile)
+        result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+    elif mode == "maze":
+        result = train_maze.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+    elif mode == "maze8":
+        result = train_maze_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+    elif mode in {"all-datasets", "all_datasets"}:
+        result = train_all_datasets.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+    elif mode in {"all-datasets8", "all_datasets8"}:
+        result = train_all_datasets_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
     elif mode in {"pack", "pack-results"}:
         result = pack_results.remote()
     elif mode == "smoke":
         result = smoke.remote(config=config)
     elif mode == "train":
-        result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile)
+        result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name)
     else:
-        raise ValueError("mode must be one of: smoke, train, all, all8, pack")
+        raise ValueError("mode must be one of: smoke, train, all, all8, maze, maze8, all-datasets, all-datasets8, pack")
 
     print(result)
     print()

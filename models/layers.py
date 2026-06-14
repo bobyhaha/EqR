@@ -146,9 +146,7 @@ class Attention(nn.Module):
         k = qkv[:, :, self.num_heads : self.num_heads + self.num_key_value_heads]
         v = qkv[:, :, self.num_heads + self.num_key_value_heads :]
         q, k = self._apply_rope(cos_sin, q, k)
-        if q.is_cuda:
-            if flash_attn_func is None:
-                colored_exception(RuntimeError, "flash_attn is not installed but CUDA attention was requested.")
+        if q.is_cuda and flash_attn_func is not None:
             y = flash_attn_func(q=q, k=k, v=v, causal=self.causal)
             if isinstance(y, tuple):
                 y = y[0]

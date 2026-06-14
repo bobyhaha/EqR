@@ -12,7 +12,11 @@ APP_NAME = "eqr-lg-prm"
 REMOTE_REPO = "/root/EqR_Modified"
 RESULTS_VOLUME = "eqr-lg-prm-results"
 DATA_VOLUME = "eqr-lg-prm-data"
-GPU_FALLBACKS = ["B200", "H200", "H100"]
+# torch==2.6.0+cu124 supports Hopper (H100/H200) but not Blackwell B200 sm_100.
+# Keep B200 out of runtime fallback until the image moves to a PyTorch/CUDA build
+# that explicitly supports sm_100.
+GPU_FALLBACKS = ["H200", "H100"]
+GPU8_FALLBACKS = ["H200:8", "H100:8"]
 BUILD_GPU = "B200"
 CUDA_BUILD_ENV = {
     "CC": "/usr/bin/gcc",
@@ -58,9 +62,10 @@ image = (
         "psutil==6.1.1",
         "tqdm==4.67.1",
         "pyyaml==6.0.2",
-        "argdantic==1.1.2",
+        "argdantic==1.3.3",
         "colorama==0.4.6",
         "huggingface_hub==0.27.1",
+        "exceptiongroup==1.2.2",
         "matplotlib==3.10.0",
         "plotly==5.24.1",
         "pandas==2.2.3",
@@ -75,17 +80,16 @@ image = (
         gpu=BUILD_GPU,
         env=CUDA_BUILD_ENV,
     )
-    .pip_install(
-        "flash-attn",
-        extra_options="--no-build-isolation --no-cache-dir",
-        gpu=BUILD_GPU,
-        env=CUDA_BUILD_ENV,
-    )
     .env(
         {
             "OUTPUT_ROOT": "/outputs",
             "RUN_ROOT": "/outputs",
             "WANDB_MODE": "offline",
+            "WANDB_CODE_UPLOAD_MODE": "off",
+            "HYDRA_FULL_ERROR": "1",
+            "PYTHONUNBUFFERED": "1",
+            "HF_HOME": f"{REMOTE_REPO}/data/.hf-cache",
+            "HF_HUB_ENABLE_HF_TRANSFER": "0",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
@@ -110,10 +114,21 @@ image = (
 
 def _run(cmd: list[str], *, env: Optional[dict[str, str]] = None) -> None:
     run_env = os.environ.copy()
+    run_env.setdefault("HYDRA_FULL_ERROR", "1")
+    run_env.setdefault("PYTHONUNBUFFERED", "1")
+    run_env.setdefault("WANDB_MODE", "offline")
+    run_env.setdefault("WANDB_CODE_UPLOAD_MODE", "off")
+    run_env.setdefault("HF_HOME", f"{REMOTE_REPO}/data/.hf-cache")
+    run_env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     if env:
         run_env.update(env)
     print(f"+ {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REMOTE_REPO, env=run_env, check=True)
+
+
+def _commit_volumes() -> None:
+    results_volume.commit()
+    data_volume.commit()
 
 
 def _ensure_sudoku_data() -> None:
@@ -126,21 +141,21 @@ def _ensure_sudoku_data() -> None:
 
 
 def _train_overrides(max_steps: Optional[int], smoke: bool, disable_compile: bool) -> list[str]:
-    overrides = ["wandb_mode=offline"]
+    overrides = ["++wandb_mode=offline"]
     if max_steps is not None:
-        overrides.append(f"max_steps={max_steps}")
+        overrides.append(f"++max_steps={max_steps}")
     if smoke:
         overrides.extend(
             [
-                "max_steps=2",
-                "eval_interval_steps=null",
-                "checkpoint_interval_steps=null",
-                "heavy_metrics_log_interval=null",
-                "steps_hist_log_interval_steps=null",
+                "++max_steps=2",
+                "++eval_interval_steps=null",
+                "++checkpoint_interval_steps=null",
+                "++heavy_metrics_log_interval=null",
+                "++steps_hist_log_interval_steps=null",
             ]
         )
     if disable_compile:
-        overrides.append("gradient_checkpoint=false")
+        overrides.append("++gradient_checkpoint=false")
     return overrides
 
 
@@ -156,20 +171,34 @@ def _train_overrides(max_steps: Optional[int], smoke: bool, disable_compile: boo
 def smoke(config: str = "lg_prm_noisy_soft_sudoku") -> dict[str, str]:
     import torch
 
-    _run(["nvidia-smi"])
-    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    try:
+        _run(["nvidia-smi"])
+        print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
-    _run(["python", "-m", "py_compile", "models/lg_prm.py", "scripts/print_model_params.py"])
-    _run(["python", "scripts/print_model_params.py", config])
+        _run(
+            [
+                "python",
+                "-m",
+                "py_compile",
+                "pretrain.py",
+                "models/lg_prm.py",
+                "utils/wandb.py",
+                "utils/checkpoint.py",
+                "scripts/print_model_params.py",
+            ]
+        )
+        _run(["python", "-c", "import exceptiongroup, adam_atan2; print('deps ok')"])
+        _run(["python", "scripts/print_model_params.py", config])
 
-    _ensure_sudoku_data()
-    _run(
-        ["bash", "scripts/train.sh", config, *_train_overrides(None, smoke=True, disable_compile=True)],
-        env={"DISABLE_COMPILE": "1"},
-    )
-    results_volume.commit()
+        _ensure_sudoku_data()
+        _run(
+            ["bash", "scripts/train.sh", config, *_train_overrides(None, smoke=True, disable_compile=True)],
+            env={"DISABLE_COMPILE": "1"},
+        )
+    finally:
+        _commit_volumes()
     return {"status": "ok", "config": config, "results_volume": RESULTS_VOLUME}
 
 
@@ -187,12 +216,14 @@ def train_config(
     max_steps: Optional[int] = None,
     disable_compile: bool = False,
 ) -> dict[str, str]:
-    _run(["nvidia-smi"])
-    _run(["python", "scripts/print_model_params.py", config])
-    _ensure_sudoku_data()
-    env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-    _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
-    results_volume.commit()
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", config])
+        _ensure_sudoku_data()
+        env = {"DISABLE_COMPILE": "1"} if disable_compile else None
+        _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
+    finally:
+        _commit_volumes()
     return {"status": "ok", "config": config, "results_volume": RESULTS_VOLUME}
 
 
@@ -206,14 +237,42 @@ def train_config(
     },
 )
 def train_all(max_steps: Optional[int] = None, disable_compile: bool = False) -> dict[str, object]:
-    _run(["nvidia-smi"])
-    _run(["python", "scripts/print_model_params.py"])
-    _ensure_sudoku_data()
-    env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-    for config in SUDOKU_CONFIGS:
-        _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
-        results_volume.commit()
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py"])
+        _ensure_sudoku_data()
+        env = {"DISABLE_COMPILE": "1"} if disable_compile else None
+        for config in SUDOKU_CONFIGS:
+            _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
+            _commit_volumes()
+    finally:
+        _commit_volumes()
     return {"status": "ok", "configs": SUDOKU_CONFIGS, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU8_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_all_8gpu(max_steps: Optional[int] = None, disable_compile: bool = False) -> dict[str, object]:
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py"])
+        _ensure_sudoku_data()
+        env = {"NPROC_PER_NODE": "8"}
+        if disable_compile:
+            env["DISABLE_COMPILE"] = "1"
+        for config in SUDOKU_CONFIGS:
+            _run(["bash", "scripts/train.sh", config, *_train_overrides(max_steps, smoke=False, disable_compile=disable_compile)], env=env)
+            _commit_volumes()
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "configs": SUDOKU_CONFIGS, "gpus": 8, "results_volume": RESULTS_VOLUME}
 
 
 @app.local_entrypoint()
@@ -225,12 +284,14 @@ def main(
 ) -> None:
     if mode == "all":
         result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile)
+    elif mode == "all8":
+        result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile)
     elif mode == "smoke":
         result = smoke.remote(config=config)
     elif mode == "train":
         result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile)
     else:
-        raise ValueError("mode must be one of: smoke, train, all")
+        raise ValueError("mode must be one of: smoke, train, all, all8")
 
     print(result)
     print()

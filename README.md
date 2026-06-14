@@ -251,7 +251,7 @@ python -m pip install modal
 modal setup
 ```
 
-Run a remote H100 smoke test. This builds the Modal image, checks CUDA,
+Run a remote H200/H100 smoke test. This builds the Modal image, checks CUDA,
 downloads/caches Sudoku data, and runs two training steps:
 
 ```bash
@@ -268,6 +268,12 @@ Train the full Sudoku comparison on Modal:
 
 ```bash
 modal run modal_eqr.py --mode all
+```
+
+Train the full Sudoku comparison on one 8-GPU node:
+
+```bash
+modal run modal_eqr.py --mode all8
 ```
 
 For a short remote training test, cap steps explicitly:

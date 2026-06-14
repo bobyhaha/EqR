@@ -14,6 +14,12 @@ RESULTS_VOLUME = "eqr-lg-prm-results"
 DATA_VOLUME = "eqr-lg-prm-data"
 GPU_FALLBACKS = ["B200", "H200", "H100"]
 BUILD_GPU = "B200"
+CUDA_BUILD_ENV = {
+    "CC": "/usr/bin/gcc",
+    "CXX": "/usr/bin/g++",
+    "TORCH_CUDA_ARCH_LIST": "9.0",
+    "MAX_JOBS": "8",
+}
 
 SUDOKU_CONFIGS = [
     "eqr_sudoku",
@@ -43,37 +49,37 @@ image = (
         index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
-        "numpy",
-        "pydantic",
-        "omegaconf",
-        "hydra-core",
-        "wandb",
-        "coolname",
-        "psutil",
-        "tqdm",
-        "pyyaml",
-        "argdantic",
-        "colorama",
-        "huggingface_hub",
-        "matplotlib",
-        "plotly",
-        "pandas",
-        "scipy",
-        "scikit-learn",
-        "packaging",
-        "wheel",
+        "numpy==1.26.4",
+        "pydantic==2.11.7",
+        "omegaconf==2.3.0",
+        "hydra-core==1.3.2",
+        "wandb==0.18.7",
+        "coolname==2.2.0",
+        "psutil==6.1.1",
+        "tqdm==4.67.1",
+        "pyyaml==6.0.2",
+        "argdantic==1.1.2",
+        "colorama==0.4.6",
+        "huggingface_hub==0.27.1",
+        "matplotlib==3.10.0",
+        "plotly==5.24.1",
+        "pandas==2.2.3",
+        "scipy==1.14.1",
+        "scikit-learn==1.6.1",
+        "packaging==24.2",
+        "wheel==0.45.1",
     )
     .pip_install(
         "adam-atan2==0.0.3",
         extra_options="--no-build-isolation --no-cache-dir",
         gpu=BUILD_GPU,
-        env={"TORCH_CUDA_ARCH_LIST": "9.0"},
+        env=CUDA_BUILD_ENV,
     )
     .pip_install(
         "flash-attn",
         extra_options="--no-build-isolation --no-cache-dir",
         gpu=BUILD_GPU,
-        env={"TORCH_CUDA_ARCH_LIST": "9.0", "MAX_JOBS": "8"},
+        env=CUDA_BUILD_ENV,
     )
     .env(
         {

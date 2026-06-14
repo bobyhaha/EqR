@@ -209,6 +209,10 @@ class ACTLossHead(BaseLossHead):
                     ),
                 }
             )
+        for key in ("gate_mean", "hard_gate_mean", "library_entropy"):
+            value = outputs.get(key)
+            if isinstance(value, torch.Tensor):
+                metrics[key] = value.to(dtype=torch.float32) * count.to(dtype=torch.float32)
         return metrics
 
     def _zh_zl_metrics(self, carry: Any, count: torch.Tensor) -> Dict[str, torch.Tensor]:

@@ -1,0 +1,28 @@
+name: lg_prm@LGPRMNoLibraryModel
+short_name: LG-PRM-NoLib
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+hidden_size: 304
+num_heads: 8
+expansion: 4
+forward_dtype: bfloat16
+
+n_explorers: 4
+explorer_mult: 0.5
+pi_layers: 4
+lg_steps: 4
+library_size: 512
+rag_library_size: 512
+mlp_library_mult: 4
+gate_threshold: 0.5
+straight_through_gate: true
+forced_library: false
+phd_lambda: 0.95
+phd_noise_scale: 0.0
+H_init_std: 1.0
+L_init_std: 1.0

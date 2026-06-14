@@ -1,0 +1,349 @@
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+import math
+
+import torch
+from pydantic import BaseModel
+from torch import nn
+import torch.nn.functional as F
+
+from models.common import trunc_normal_init_
+from models.layers import CastedEmbedding, CastedLinear, SwiGLU, rms_norm
+
+
+@dataclass
+class LatentCarry:
+    z_H: torch.Tensor
+    z_L: torch.Tensor
+
+
+@dataclass
+class ModelCarry:
+    inner_carry: LatentCarry
+    steps: torch.Tensor
+    halted: torch.Tensor
+    current_data: Dict[str, torch.Tensor]
+    global_step: Optional[int] = None
+    halt_counter: Optional[torch.Tensor] = None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+class LGPRMConfig(BaseModel):
+    batch_size: int
+    seq_len: int
+    vocab_size: int
+    hidden_size: int
+    num_heads: int = 1
+    expansion: float = 4.0
+    forward_dtype: str = "bfloat16"
+    halt_max_steps: int
+    halt_exploration_prob: float
+    halt_threshold: float = 0.0
+
+    n_explorers: int = 8
+    explorer_mult: float = 0.5
+    pi_layers: int = 2
+    lg_steps: int = 4
+    library_size: int = 256
+    rag_library_size: Optional[int] = None
+    mlp_library_mult: float = 4.0
+    gate_mode: str = "hard"
+    gate_threshold: float = 0.5
+    straight_through_gate: bool = True
+    forced_library: bool = False
+    use_library: bool = True
+
+    phd_lambda: float = 0.95
+    phd_noise_scale: float = 0.0
+    H_init_std: float = 1.0
+    L_init_std: float = 1.0
+    rms_norm_eps: float = 1e-5
+
+
+class Explorer(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        d = config.hidden_size
+        h = max(8, int(d * config.explorer_mult))
+        self.up = CastedLinear(2 * d, h, bias=True)
+        self.down = CastedLinear(h, d, bias=True)
+
+    def forward(self, state: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, xs], dim=-1)
+        return self.down(F.gelu(self.up(rms_norm(x, self.config.rms_norm_eps))))
+
+
+class ExplorerBank(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([Explorer(config) for _ in range(config.n_explorers)])
+        self.lambda_ = float(config.phd_lambda)
+        self.noise_scale = float(config.phd_noise_scale)
+
+    def forward(self, state: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+        proposals = torch.stack([layer(state, xs) for layer in self.layers], dim=1)
+        if self.noise_scale <= 0:
+            return proposals
+        updated = proposals
+        noise = torch.randn_like(updated) * self.noise_scale
+        return (1.0 - self.lambda_) * proposals.detach() + self.lambda_ * updated + noise
+
+
+class RAGLibrary(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        size = config.rag_library_size or config.library_size
+        d = config.hidden_size
+        self.keys = nn.Parameter(torch.randn(size, d) / math.sqrt(d))
+        self.values = nn.Parameter(torch.randn(size, d) / math.sqrt(d))
+
+    def forward(self, q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        keys = self.keys.to(q.dtype)
+        values = self.values.to(q.dtype)
+        attn = F.softmax(q @ keys.T / math.sqrt(q.shape[-1]), dim=-1)
+        return attn @ values, attn
+
+
+class MLPLibrary(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        d = config.hidden_size
+        h = max(8, int(d * config.mlp_library_mult))
+        self.up = CastedLinear(d, h, bias=True)
+        self.down = CastedLinear(h, d, bias=True)
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        q = rms_norm(q, self.config.rms_norm_eps)
+        return self.down(F.gelu(self.up(q)))
+
+
+class Gate(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        d = config.hidden_size
+        self.up = CastedLinear(2 * d, d, bias=True)
+        self.down = CastedLinear(d, 1, bias=True)
+
+    def forward(self, state: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([state, xs], dim=-1)
+        return torch.sigmoid(self.down(F.gelu(self.up(rms_norm(x, self.config.rms_norm_eps)))))
+
+
+class PIModule(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        d = config.hidden_size
+        self.in_proj = CastedLinear(4 * d, d, bias=True)
+        self.layers = nn.ModuleList([SwiGLU(d, config.expansion) for _ in range(config.pi_layers)])
+        self.out = CastedLinear(d, d, bias=True)
+
+    def forward(self, state: torch.Tensor, xs: torch.Tensor, proposal: torch.Tensor, libvec: torch.Tensor) -> torch.Tensor:
+        z = self.in_proj(torch.cat([state, xs, proposal, libvec], dim=-1))
+        for layer in self.layers:
+            z = rms_norm(z + layer(z), self.config.rms_norm_eps)
+        return state + self.out(rms_norm(z, self.config.rms_norm_eps))
+
+
+class InnerNetwork(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.forward_dtype = getattr(torch, config.forward_dtype)
+        d = config.hidden_size
+        self.embed_scale = math.sqrt(d)
+        self.embed_tokens = CastedEmbedding(config.vocab_size, d, 1.0 / self.embed_scale, self.forward_dtype)
+        self.state_init = CastedLinear(d, d, bias=True)
+        self.explorers = ExplorerBank(config)
+        self.rag_library = RAGLibrary(config) if config.use_library else None
+        self.mlp_library = MLPLibrary(config) if config.use_library else None
+        self.gate = Gate(config) if config.use_library else None
+        self.pi = PIModule(config)
+        self.lm_head = CastedLinear(d, config.vocab_size, bias=False)
+        self.q_head = CastedLinear(d, 2, bias=True)
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(d, dtype=self.forward_dtype), std=config.H_init_std), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(d, dtype=self.forward_dtype), std=config.L_init_std), persistent=True)
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)
+
+    def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_scale * self.embed_tokens(input_ids.to(torch.int32))
+
+    def empty_carry(self, batch_size: int, device: Optional[torch.device] = None) -> LatentCarry:
+        shape = (batch_size, self.config.seq_len, self.config.hidden_size)
+        return LatentCarry(
+            z_H=torch.empty(shape, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(shape, dtype=self.forward_dtype, device=device),
+        )
+
+    def reset_carry(self, reset_flag: torch.Tensor, carry: LatentCarry) -> LatentCarry:
+        h = self.H_init.to(device=carry.z_H.device, dtype=carry.z_H.dtype).view(1, 1, -1)
+        l = self.L_init.to(device=carry.z_L.device, dtype=carry.z_L.dtype).view(1, 1, -1)
+        mask = reset_flag.to(device=carry.z_H.device).view(-1, 1, 1)
+        return LatentCarry(torch.where(mask, h, carry.z_H), torch.where(mask, l, carry.z_L))
+
+    def _gate_value(self, gate_prob: torch.Tensor) -> torch.Tensor:
+        if self.config.forced_library:
+            return torch.ones_like(gate_prob)
+        if self.config.gate_mode == "soft":
+            return gate_prob
+        hard = (gate_prob >= self.config.gate_threshold).to(gate_prob.dtype)
+        if self.training and self.config.straight_through_gate:
+            return hard + gate_prob - gate_prob.detach()
+        return hard
+
+    def forward_no_carry(
+        self,
+        z_H: torch.Tensor,
+        z_L: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+        token_features = self._input_embeddings(batch["inputs"])
+        xs = token_features.mean(dim=1)
+        state = self.state_init(rms_norm((z_H + token_features).mean(dim=1), self.config.rms_norm_eps))
+        gate_values = []
+        hard_values = []
+        entropies = []
+        for _ in range(self.config.lg_steps):
+            proposals = self.explorers(state, xs)
+            proposal = proposals.mean(dim=1)
+            if self.config.use_library:
+                gate_prob = self.gate(state, xs)
+                gate = self._gate_value(gate_prob)
+                rag, attn = self.rag_library(state)
+                mlp = self.mlp_library(state)
+                libvec = gate * 0.5 * (rag + mlp)
+                gate_values.append(gate_prob.to(torch.float32).mean())
+                hard_values.append((gate >= self.config.gate_threshold).to(torch.float32).mean())
+                entropies.append((-(attn * attn.clamp_min(1e-8).log()).sum(dim=-1)).to(torch.float32).mean())
+            else:
+                libvec = torch.zeros_like(state)
+                gate_values.append(state.new_tensor(0.0, dtype=torch.float32))
+                hard_values.append(state.new_tensor(0.0, dtype=torch.float32))
+                entropies.append(state.new_tensor(0.0, dtype=torch.float32))
+            state = self.pi(state, xs, proposal, libvec)
+        diagnostics = {
+            "gate_mean": torch.stack(gate_values).mean() if gate_values else state.new_tensor(0.0, dtype=torch.float32),
+            "hard_gate_mean": torch.stack(hard_values).mean() if hard_values else state.new_tensor(0.0, dtype=torch.float32),
+            "library_entropy": torch.stack(entropies).mean() if entropies else state.new_tensor(0.0, dtype=torch.float32),
+        }
+        z_H = token_features + state.unsqueeze(1)
+        z_L = token_features
+        logits = self.lm_head(rms_norm(z_H, self.config.rms_norm_eps))
+        q = self.q_head(rms_norm(state, self.config.rms_norm_eps)).to(torch.float32)
+        return (z_H, z_L), logits, (q[..., 0], q[..., 1]), diagnostics
+
+    def forward(self, carry: LatentCarry, batch: Dict[str, torch.Tensor]) -> Tuple[LatentCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+        (z_H, z_L), logits, q, diagnostics = self.forward_no_carry(carry.z_H, carry.z_L, batch)
+        return LatentCarry(z_H.detach(), z_L.detach()), logits, q, diagnostics
+
+    def concat_states(self, z_H: torch.Tensor, z_L: torch.Tensor) -> torch.Tensor:
+        return torch.cat((z_H, z_L), dim=1)
+
+    def split_states(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        n = self.config.seq_len
+        return state[:, :n, :], state[:, n:, :]
+
+
+class LGPRMModel(nn.Module):
+    gate_mode: str = "hard"
+    phd_noise_scale: float = 0.0
+
+    def __init__(self, config_dict: dict) -> None:
+        super().__init__()
+        config_dict = dict(config_dict)
+        config_dict.setdefault("gate_mode", self.gate_mode)
+        config_dict.setdefault("phd_noise_scale", self.phd_noise_scale)
+        self.config = LGPRMConfig(**config_dict)
+        self.inner = InnerNetwork(self.config)
+
+    def initial_carry(self, batch: Dict[str, torch.Tensor]) -> ModelCarry:
+        b, device = batch["inputs"].shape[0], batch["inputs"].device
+        c = self.inner.empty_carry(b)
+        return ModelCarry(
+            inner_carry=LatentCarry(c.z_H.to(device), c.z_L.to(device)),
+            steps=torch.zeros((b,), dtype=torch.int32, device=device),
+            halted=torch.ones((b,), dtype=torch.bool, device=device),
+            current_data={k: torch.empty_like(v, device=device) for k, v in batch.items()},
+            halt_counter=torch.zeros((b,), dtype=torch.int32, device=device),
+        )
+
+    def forward(self, carry: ModelCarry, batch: Dict[str, torch.Tensor], **kwargs: Any) -> Tuple[ModelCarry, Dict[str, torch.Tensor]]:
+        del kwargs
+        device = batch["inputs"].device
+        halted_prev = carry.halted.to(device)
+        inner = self.inner.reset_carry(halted_prev, LatentCarry(carry.inner_carry.z_H.to(device), carry.inner_carry.z_L.to(device)))
+        steps = torch.where(halted_prev, torch.zeros_like(carry.steps.to(device)), carry.steps.to(device))
+        data = {
+            k: torch.where(halted_prev.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v.to(device))
+            for k, v in carry.current_data.items()
+        }
+        inner, logits, (q_halt, q_continue), diagnostics = self.inner(inner, data)
+        out = {
+            "logits": logits,
+            "q_halt_logits": q_halt,
+            "q_continue_logits": q_continue,
+            **diagnostics,
+        }
+        with torch.no_grad():
+            steps = steps + 1
+            is_last = steps >= self.config.halt_max_steps
+            halted = is_last
+            if self.training and self.config.halt_max_steps > 1:
+                min_steps = (torch.rand_like(q_halt) < self.config.halt_exploration_prob) * torch.randint_like(steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (steps >= min_steps)
+        return ModelCarry(inner, steps, halted, data, halt_counter=torch.zeros_like(steps)), out
+
+    def pack_solver_state(self, z_H: torch.Tensor, z_L: torch.Tensor) -> torch.Tensor:
+        return self.inner.concat_states(z_H, z_L)
+
+    def unpack_solver_state(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.inner.split_states(state)
+
+    def initial_solver_state(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        b, device = batch["inputs"].shape[0], batch["inputs"].device
+        shape = (b, self.config.seq_len, self.config.hidden_size)
+        z_H = self.inner.H_init.to(device=device).view(1, 1, -1).expand(shape).clone()
+        z_L = self.inner.L_init.to(device=device).view(1, 1, -1).expand(shape).clone()
+        return self.pack_solver_state(z_H, z_L)
+
+    def solver_step(self, state: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        z_H, z_L = self.unpack_solver_state(state)
+        (z_H, z_L), logits, q, _ = self.inner.forward_no_carry(z_H, z_L, batch)
+        return self.pack_solver_state(z_H.detach(), z_L.detach()), logits, q
+
+
+class LGPRMHardModel(LGPRMModel):
+    gate_mode = "hard"
+    phd_noise_scale = 0.0
+
+
+class LGPRMSoftModel(LGPRMModel):
+    gate_mode = "soft"
+    phd_noise_scale = 0.0
+
+
+class LGPRMNoisyHardModel(LGPRMModel):
+    gate_mode = "hard"
+    phd_noise_scale = 0.01
+
+
+class LGPRMNoisySoftModel(LGPRMModel):
+    gate_mode = "soft"
+    phd_noise_scale = 0.01
+
+
+class LGPRMNoLibraryModel(LGPRMModel):
+    gate_mode = "hard"
+    phd_noise_scale = 0.0
+
+    def __init__(self, config_dict: dict) -> None:
+        config_dict = dict(config_dict)
+        config_dict["use_library"] = False
+        super().__init__(config_dict)

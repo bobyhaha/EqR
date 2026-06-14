@@ -205,8 +205,42 @@ NPROC_PER_NODE=2 bash scripts/train.sh eqr_maze_unique
 | --- | --- | ---: |
 | Sudoku-Extreme | `config/train/eqr_sudoku.yaml` | 50k |
 | Sudoku-Extreme TRM baseline | `config/train/trm_sudoku.yaml` | 50k |
+| Sudoku-Extreme LG-PRM hard gate | `config/train/lg_prm_hard_sudoku.yaml` | 50k |
+| Sudoku-Extreme LG-PRM soft gate | `config/train/lg_prm_soft_sudoku.yaml` | 50k |
+| Sudoku-Extreme LG-PRM noisy hard gate | `config/train/lg_prm_noisy_hard_sudoku.yaml` | 50k |
+| Sudoku-Extreme LG-PRM noisy soft gate | `config/train/lg_prm_noisy_soft_sudoku.yaml` | 50k |
+| Sudoku-Extreme LG-PRM no library | `config/train/lg_prm_no_library_sudoku.yaml` | 50k |
 | Maze-Unique | `config/train/eqr_maze_unique.yaml` | 100k |
 | Maze-Unique TRM baseline | `config/train/trm_maze_unique.yaml` | 100k |
+
+LG-PRM Sudoku variants:
+
+```bash
+python scripts/print_model_params.py
+bash scripts/train.sh lg_prm_hard_sudoku
+bash scripts/train.sh lg_prm_soft_sudoku
+bash scripts/train.sh lg_prm_noisy_hard_sudoku
+bash scripts/train.sh lg_prm_noisy_soft_sudoku
+bash scripts/train.sh lg_prm_no_library_sudoku
+```
+
+The Sudoku model sizes are parameter-matched:
+
+```text
+EqR Sudoku:               4,855,298 params
+TRM Sudoku:               4,855,298 params
+LG-PRM hard Sudoku:       4,852,331 params
+LG-PRM soft Sudoku:       4,852,331 params
+LG-PRM noisy-hard Sudoku: 4,852,331 params
+LG-PRM noisy-soft Sudoku: 4,852,331 params
+LG-PRM no-library Sudoku: 4,854,578 params
+```
+
+Run the full Sudoku comparison:
+
+```bash
+bash scripts/run_sudoku_lg_prm_experiment.sh
+```
 
 ## Evaluation
 

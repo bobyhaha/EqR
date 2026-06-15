@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import subprocess
 import tarfile
 from pathlib import Path
@@ -154,6 +155,40 @@ def _run(cmd: list[str], *, env: Optional[dict[str, str]] = None) -> None:
         run_env.update(env)
     print(f"+ {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REMOTE_REPO, env=run_env, check=True)
+
+
+def _run_with_periodic_result_commits(
+    cmd: list[str],
+    *,
+    env: Optional[dict[str, str]] = None,
+    commit_interval_seconds: int = 60,
+) -> None:
+    run_env = os.environ.copy()
+    run_env.setdefault("HYDRA_FULL_ERROR", "1")
+    run_env.setdefault("PYTHONUNBUFFERED", "1")
+    run_env.setdefault("WANDB_MODE", "offline")
+    run_env.setdefault("WANDB_CODE_UPLOAD_MODE", "off")
+    run_env.setdefault("HF_HOME", f"{REMOTE_REPO}/data/.hf-cache")
+    run_env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+    if env:
+        run_env.update(env)
+
+    print(f"+ {' '.join(cmd)}", flush=True)
+    proc = subprocess.Popen(cmd, cwd=REMOTE_REPO, env=run_env)
+    last_commit = time.monotonic()
+    while True:
+        ret = proc.poll()
+        now = time.monotonic()
+        if ret is not None:
+            results_volume.commit()
+            if ret != 0:
+                raise subprocess.CalledProcessError(ret, cmd)
+            return
+        if now - last_commit >= commit_interval_seconds:
+            print("[Modal] committing results volume during training", flush=True)
+            results_volume.commit()
+            last_commit = now
+        time.sleep(5)
 
 
 def _commit_volumes() -> None:
@@ -385,7 +420,7 @@ def train_config(
         checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
         if checkpoint is not None:
             print(f"Resuming {config} from {checkpoint}", flush=True)
-        _run(
+        _run_with_periodic_result_commits(
             [
                 "bash",
                 "scripts/train.sh",
@@ -401,6 +436,7 @@ def train_config(
                 ),
             ],
             env=env,
+            commit_interval_seconds=60,
         )
     finally:
         _commit_volumes()
@@ -422,7 +458,7 @@ def _train_configs(
         checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
         if checkpoint is not None:
             print(f"Resuming {config} from {checkpoint}", flush=True)
-        _run(
+        _run_with_periodic_result_commits(
             [
                 "bash",
                 "scripts/train.sh",
@@ -438,6 +474,7 @@ def _train_configs(
                 ),
             ],
             env=env,
+            commit_interval_seconds=60,
         )
         _commit_volumes()
 

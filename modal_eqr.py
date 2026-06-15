@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import modal
+import yaml
 
 
 APP_NAME = "eqr-lg-prm"
@@ -223,18 +224,79 @@ def _configs_from(configs: list[str], start_config: Optional[str]) -> list[str]:
     return configs[configs.index(start_config):]
 
 
+def _load_yaml(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _run_name_for_config(config: str) -> str:
+    train = _load_yaml(Path(REMOTE_REPO) / "config" / "train" / f"{config}.yaml")
+    arch_name = None
+    dataset_name = None
+    for item in train.get("defaults", []):
+        if isinstance(item, dict):
+            arch_name = item.get("/arch", arch_name)
+            dataset_name = item.get("/dataset", dataset_name)
+    if not arch_name or not dataset_name:
+        raise ValueError(f"Could not resolve arch/dataset for {config}")
+    arch = _load_yaml(Path(REMOTE_REPO) / "config" / "arch" / f"{arch_name}.yaml")
+    dataset = _load_yaml(Path(REMOTE_REPO) / "config" / "dataset" / f"{dataset_name}.yaml")
+    model_id = arch.get("short_name") or str(arch["name"]).split("@")[-1]
+    return f"{model_id}-{dataset['name']}"
+
+
+def _checkpoint_step(path: Path) -> int:
+    stem = path.stem
+    if not stem.startswith("step_"):
+        return -1
+    try:
+        return int(stem.split("_", 2)[1])
+    except Exception:
+        return -1
+
+
+def _latest_checkpoint_for_config(config: str, experiment_name: Optional[str]) -> Optional[Path]:
+    outputs = Path("/outputs/outputs")
+    if not outputs.exists():
+        return None
+
+    expected_name = _run_name_for_config(config)
+    candidates: list[Path] = []
+    for cfg_path in outputs.glob("*/*/*/all_config.yaml"):
+        try:
+            saved = _load_yaml(cfg_path)
+        except Exception:
+            continue
+        meta = saved.get("wandb_meta", {}) or {}
+        if meta.get("name") != expected_name:
+            continue
+        if experiment_name and meta.get("project") != experiment_name:
+            continue
+        candidates.extend(cfg_path.parent.glob("checkpoints/step_*.pth"))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: (_checkpoint_step(p), p.stat().st_mtime))
+
+
 def _train_overrides(
     max_steps: Optional[int],
     smoke: bool,
     disable_compile: bool,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = None,
+    load_checkpoint: Optional[Path] = None,
 ) -> list[str]:
     overrides = ["++wandb_mode=offline"]
     if experiment_name:
         overrides.append(f"++project_name={experiment_name}")
+    if load_checkpoint is not None:
+        overrides.append(f"++load_checkpoint={load_checkpoint}")
     if max_steps is not None:
         overrides.append(f"++max_steps={max_steps}")
+    if checkpoint_interval_steps is not None:
+        overrides.append(f"++checkpoint_interval_steps={checkpoint_interval_steps}")
     if skip_eval:
         overrides.append("++eval_interval_steps=null")
     if smoke:
@@ -312,12 +374,17 @@ def train_config(
     disable_compile: bool = False,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, str]:
     try:
         _run(["nvidia-smi"])
         _run(["python", "scripts/print_model_params.py", config])
         _ensure_data_for_config(config)
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
+        checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
+        if checkpoint is not None:
+            print(f"Resuming {config} from {checkpoint}", flush=True)
         _run(
             [
                 "bash",
@@ -329,6 +396,8 @@ def train_config(
                     disable_compile=disable_compile,
                     skip_eval=skip_eval,
                     experiment_name=experiment_name,
+                    checkpoint_interval_steps=checkpoint_interval_steps,
+                    load_checkpoint=checkpoint,
                 ),
             ],
             env=env,
@@ -345,9 +414,14 @@ def _train_configs(
     env: Optional[dict[str, str]],
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> None:
     for config in configs:
         _ensure_data_for_config(config)
+        checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
+        if checkpoint is not None:
+            print(f"Resuming {config} from {checkpoint}", flush=True)
         _run(
             [
                 "bash",
@@ -359,6 +433,8 @@ def _train_configs(
                     disable_compile=disable_compile,
                     skip_eval=skip_eval,
                     experiment_name=experiment_name,
+                    checkpoint_interval_steps=checkpoint_interval_steps,
+                    load_checkpoint=checkpoint,
                 ),
             ],
             env=env,
@@ -381,13 +457,15 @@ def train_all(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(SUDOKU_CONFIGS, start_config)
     try:
         _run(["nvidia-smi"])
         _run(["python", "scripts/print_model_params.py", *configs])
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -408,13 +486,15 @@ def train_maze(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(MAZE_CONFIGS, start_config)
     try:
         _run(["nvidia-smi"])
         _run(["python", "scripts/print_model_params.py", *configs])
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -435,13 +515,15 @@ def train_all_datasets(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(ALL_CONFIGS, start_config)
     try:
         _run(["nvidia-smi"])
         _run(["python", "scripts/print_model_params.py", *configs])
         env = {"DISABLE_COMPILE": "1"} if disable_compile else None
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -462,6 +544,8 @@ def train_all_8gpu(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(SUDOKU_CONFIGS, start_config)
     try:
@@ -470,7 +554,7 @@ def train_all_8gpu(
         env = {"NPROC_PER_NODE": "8"}
         if disable_compile:
             env["DISABLE_COMPILE"] = "1"
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -491,6 +575,8 @@ def train_maze_8gpu(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(MAZE_CONFIGS, start_config)
     try:
@@ -499,7 +585,7 @@ def train_maze_8gpu(
         env = {"NPROC_PER_NODE": "8"}
         if disable_compile:
             env["DISABLE_COMPILE"] = "1"
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -520,6 +606,8 @@ def train_all_datasets_8gpu(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> dict[str, object]:
     configs = _configs_from(ALL_CONFIGS, start_config)
     try:
@@ -528,7 +616,7 @@ def train_all_datasets_8gpu(
         env = {"NPROC_PER_NODE": "8"}
         if disable_compile:
             env["DISABLE_COMPILE"] = "1"
-        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name)
+        _train_configs(configs, max_steps, disable_compile, env, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     finally:
         _commit_volumes()
     return {"status": "ok", "configs": configs, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
@@ -565,25 +653,27 @@ def main(
     start_config: Optional[str] = None,
     skip_eval: bool = False,
     experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
 ) -> None:
     if mode == "all":
-        result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_all.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode == "all8":
-        result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_all_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode == "maze":
-        result = train_maze.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_maze.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode == "maze8":
-        result = train_maze_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_maze_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode in {"all-datasets", "all_datasets"}:
-        result = train_all_datasets.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_all_datasets.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode in {"all-datasets8", "all_datasets8"}:
-        result = train_all_datasets_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_all_datasets_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode in {"pack", "pack-results"}:
         result = pack_results.remote()
     elif mode == "smoke":
         result = smoke.remote(config=config)
     elif mode == "train":
-        result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name)
+        result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     else:
         raise ValueError("mode must be one of: smoke, train, all, all8, maze, maze8, all-datasets, all-datasets8, pack")
 

@@ -3,6 +3,9 @@ short_name: LG-PRM-NoLib
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  proposal_diversity_weight: 0.01
+  proposal_entropy_weight: 0.001
+  library_entropy_weight: 0.0
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
@@ -22,6 +25,8 @@ mlp_library_mult: 4
 gate_threshold: 0.5
 straight_through_gate: true
 forced_library: false
+proposal_pool: attention
+recurrent_update: residual
 phd_lambda: 0.95
 phd_noise_scale: 0.0
 H_init_std: 1.0

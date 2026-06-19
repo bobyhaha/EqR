@@ -43,12 +43,23 @@ def _compute_z_alignment_per_sample(
 
 class ACTLossHead(BaseLossHead):
 
-    def __init__(self, model: nn.Module, loss_type: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        loss_type: str,
+        proposal_diversity_weight: float = 0.0,
+        proposal_entropy_weight: float = 0.0,
+        library_entropy_weight: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
 
         del kwargs
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.proposal_diversity_weight = float(proposal_diversity_weight)
+        self.proposal_entropy_weight = float(proposal_entropy_weight)
+        self.library_entropy_weight = float(library_entropy_weight)
 
     def initial_carry(self, *args: Any, **kwargs: Any) -> Any:
         return self.model.initial_carry(*args, **kwargs)  # type: ignore[attr-defined]
@@ -121,7 +132,23 @@ class ACTLossHead(BaseLossHead):
         metrics.update({key: value.detach() for key, value in losses.items()})
 
         detached_outputs = {key: outputs[key].detach() for key in return_keys if key in outputs}
-        total_loss = losses["lm_loss"] + 0.5 * q_halt_loss
+        aux_loss = outputs["logits"].new_tensor(0.0)
+        aux_scale = count.clamp_min(1).to(device=aux_loss.device, dtype=aux_loss.dtype)
+        proposal_diversity = outputs.get("proposal_diversity_loss")
+        if self.proposal_diversity_weight and isinstance(proposal_diversity, torch.Tensor):
+            aux_loss = aux_loss + self.proposal_diversity_weight * proposal_diversity.to(aux_loss.dtype) * aux_scale
+            metrics["proposal_diversity_aux"] = proposal_diversity.detach()
+        proposal_entropy = outputs.get("proposal_entropy")
+        if self.proposal_entropy_weight and isinstance(proposal_entropy, torch.Tensor):
+            aux_loss = aux_loss - self.proposal_entropy_weight * proposal_entropy.to(aux_loss.dtype) * aux_scale
+            metrics["proposal_entropy_bonus"] = proposal_entropy.detach()
+        library_entropy = outputs.get("library_entropy")
+        if self.library_entropy_weight and isinstance(library_entropy, torch.Tensor):
+            aux_loss = aux_loss - self.library_entropy_weight * library_entropy.to(aux_loss.dtype) * aux_scale
+            metrics["library_entropy_bonus"] = library_entropy.detach()
+        metrics["aux_loss"] = aux_loss.detach()
+
+        total_loss = losses["lm_loss"] + 0.5 * q_halt_loss + aux_loss
         metrics["total_loss"] = total_loss.detach()
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 
@@ -209,7 +236,7 @@ class ACTLossHead(BaseLossHead):
                     ),
                 }
             )
-        for key in ("gate_mean", "hard_gate_mean", "library_entropy"):
+        for key in ("gate_mean", "hard_gate_mean", "library_entropy", "proposal_entropy", "proposal_diversity_loss"):
             value = outputs.get(key)
             if isinstance(value, torch.Tensor):
                 metrics[key] = value.to(dtype=torch.float32) * count.to(dtype=torch.float32)

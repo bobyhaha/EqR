@@ -54,6 +54,8 @@ class LGPRMConfig(BaseModel):
     straight_through_gate: bool = True
     forced_library: bool = False
     use_library: bool = True
+    proposal_pool: str = "attention"
+    recurrent_update: str = "residual"
 
     phd_lambda: float = 0.95
     phd_noise_scale: float = 0.0
@@ -172,6 +174,30 @@ class InnerNetwork(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
 
+    def _pool_proposals(self, state: torch.Tensor, proposals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mode = self.config.proposal_pool.lower()
+        if mode == "mean":
+            attn = proposals.new_full(proposals.shape[:2], 1.0 / proposals.shape[1])
+            return proposals.mean(dim=1), attn
+        if mode != "attention":
+            raise ValueError(f"Unknown proposal_pool: {self.config.proposal_pool}")
+
+        query = rms_norm(state, self.config.rms_norm_eps).unsqueeze(1)
+        keys = rms_norm(proposals, self.config.rms_norm_eps)
+        scores = (query * keys).sum(dim=-1) / math.sqrt(proposals.shape[-1])
+        attn = F.softmax(scores, dim=-1)
+        return (attn.unsqueeze(-1) * proposals).sum(dim=1), attn
+
+    def _proposal_diversity(self, proposals: torch.Tensor) -> torch.Tensor:
+        if proposals.shape[1] <= 1:
+            return proposals.new_tensor(0.0, dtype=torch.float32)
+        p = F.normalize(proposals.to(torch.float32), dim=-1)
+        sim = p @ p.transpose(1, 2)
+        eye = torch.eye(sim.shape[-1], dtype=torch.bool, device=sim.device).unsqueeze(0)
+        off_diag = sim.masked_fill(eye, 0.0)
+        denom = proposals.shape[1] * (proposals.shape[1] - 1)
+        return (off_diag.square().sum(dim=(1, 2)) / denom).mean()
+
     def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_scale * self.embed_tokens(input_ids.to(torch.int32))
 
@@ -206,13 +232,18 @@ class InnerNetwork(nn.Module):
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         token_features = self._input_embeddings(batch["inputs"])
         xs = token_features.mean(dim=1)
-        state = self.state_init(rms_norm((z_H + token_features).mean(dim=1), self.config.rms_norm_eps))
+        carried_tokens = rms_norm(z_H + token_features, self.config.rms_norm_eps)
+        state = self.state_init(carried_tokens.mean(dim=1))
         gate_values = []
         hard_values = []
         entropies = []
+        proposal_entropies = []
+        proposal_diversities = []
         for _ in range(self.config.lg_steps):
             proposals = self.explorers(state, xs)
-            proposal = proposals.mean(dim=1)
+            proposal, proposal_attn = self._pool_proposals(state, proposals)
+            proposal_entropies.append((-(proposal_attn * proposal_attn.clamp_min(1e-8).log()).sum(dim=-1)).to(torch.float32).mean())
+            proposal_diversities.append(self._proposal_diversity(proposals))
             if self.config.use_library:
                 gate_prob = self.gate(state, xs)
                 gate = self._gate_value(gate_prob)
@@ -232,8 +263,15 @@ class InnerNetwork(nn.Module):
             "gate_mean": torch.stack(gate_values).mean() if gate_values else state.new_tensor(0.0, dtype=torch.float32),
             "hard_gate_mean": torch.stack(hard_values).mean() if hard_values else state.new_tensor(0.0, dtype=torch.float32),
             "library_entropy": torch.stack(entropies).mean() if entropies else state.new_tensor(0.0, dtype=torch.float32),
+            "proposal_entropy": torch.stack(proposal_entropies).mean() if proposal_entropies else state.new_tensor(0.0, dtype=torch.float32),
+            "proposal_diversity_loss": torch.stack(proposal_diversities).mean() if proposal_diversities else state.new_tensor(0.0, dtype=torch.float32),
         }
-        z_H = token_features + state.unsqueeze(1)
+        if self.config.recurrent_update.lower() == "legacy":
+            z_H = token_features + state.unsqueeze(1)
+        elif self.config.recurrent_update.lower() == "residual":
+            z_H = rms_norm(carried_tokens + state.unsqueeze(1), self.config.rms_norm_eps)
+        else:
+            raise ValueError(f"Unknown recurrent_update: {self.config.recurrent_update}")
         z_L = token_features
         logits = self.lm_head(rms_norm(z_H, self.config.rms_norm_eps))
         q = self.q_head(rms_norm(state, self.config.rms_norm_eps)).to(torch.float32)

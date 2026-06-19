@@ -28,7 +28,7 @@ class DataProcessConfig(BaseModel):
     train_samples: int = 1000
     test_samples: int = 1000
 
-    maze_mode: str = "random"  # random | perfect
+    maze_mode: str = "random"  # random | perfect | direct_multi
     wall_prob: float = 0.37
     dedupe: bool = False
 
@@ -165,6 +165,63 @@ def _generate_perfect_maze(n: int, rng: np.random.Generator) -> np.ndarray:
     return open_mask
 
 
+def _generate_direct_multi_maze(
+    n: int,
+    length: int,
+    wall_prob: float,
+    rng: np.random.Generator,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int], List[Tuple[int, int]]]]:
+    max_manhattan = 2 * (n - 1)
+    if n < 3 or length < 2:
+        return None
+    length = min(length, max_manhattan)
+
+    min_dy = max(1, length - (n - 1))
+    max_dy = min(n - 1, length - 1)
+    if min_dy > max_dy:
+        return None
+
+    dy_abs = int(rng.integers(min_dy, max_dy + 1))
+    dx_abs = int(length - dy_abs)
+    if dx_abs < 1 or dx_abs >= n:
+        return None
+
+    sign_y = -1 if int(rng.integers(2)) else 1
+    sign_x = -1 if int(rng.integers(2)) else 1
+    y_low = dy_abs if sign_y < 0 else 0
+    y_high = n if sign_y < 0 else n - dy_abs
+    x_low = dx_abs if sign_x < 0 else 0
+    x_high = n if sign_x < 0 else n - dx_abs
+    if y_low >= y_high or x_low >= x_high:
+        return None
+
+    start = (int(rng.integers(y_low, y_high)), int(rng.integers(x_low, x_high)))
+    goal = (start[0] + sign_y * dy_abs, start[1] + sign_x * dx_abs)
+
+    open_mask = rng.random((n, n)) >= wall_prob
+    y0, y1 = sorted((start[0], goal[0]))
+    x0, x1 = sorted((start[1], goal[1]))
+    # Keep the full shortest-path rectangle open. Since both dimensions are
+    # non-zero, this guarantees at least two shortest S->G paths without
+    # rejection sampling.
+    open_mask[y0 : y1 + 1, x0 : x1 + 1] = True
+    open_mask[start] = True
+    open_mask[goal] = True
+
+    steps = [(sign_y, 0)] * dy_abs + [(0, sign_x)] * dx_abs
+    rng.shuffle(steps)
+    path = [start]
+    y, x = start
+    for step_y, step_x in steps:
+        y += step_y
+        x += step_x
+        path.append((y, x))
+
+    if path[-1] != goal or len(path) != length + 1:
+        return None
+    return open_mask, start, goal, path
+
+
 def _reconstruct_path(
     parent: np.ndarray,
     start: Tuple[int, int],
@@ -242,6 +299,9 @@ def _generate_single_sample(
     maze_mode: str,
 ) -> Optional[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int], List[Tuple[int, int]]]]:
     mode = maze_mode.lower()
+    if mode in {"direct_multi", "open_multi"}:
+        return _generate_direct_multi_maze(n, length, wall_prob, rng)
+
     for _ in range(max_grid_attempts):
         if mode == "perfect":
             maze_n = n if n % 2 == 1 else n - 1

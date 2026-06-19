@@ -29,26 +29,26 @@ def build_unique(train_samples: int, test_samples: int, seed: int) -> None:
 
 
 def build_multi(train_samples: int, test_samples: int, seed: int) -> None:
-    # Multi-solution mazes are deliberately more open than the unique/perfect
-    # mazes. This keeps generation practical while preserving the ambiguity:
-    # start/goal pairs must still have at least two shortest paths.
+    # Multi-solution mazes are constructed directly. The S/G rectangle is kept
+    # open, so every sample has multiple shortest paths without rejection
+    # sampling.
     preprocess_data(
         DataProcessConfig(
             output_dir="data/maze-30x30-multi-1k",
             grid_size=30,
             train_samples=train_samples,
             test_samples=test_samples,
-            maze_mode="random",
-            wall_prob=0.08,
+            maze_mode="direct_multi",
+            wall_prob=0.20,
             length_distribution="uniform",
             min_path_length=20,
-            max_path_length=80,
+            max_path_length=50,
             strict_length=False,
             require_multiple=True,
             dedupe=True,
-            max_length_resamples=50,
-            max_grid_attempts=100,
-            max_start_attempts=200,
+            max_length_resamples=10,
+            max_grid_attempts=1,
+            max_start_attempts=1,
             seed=seed,
         )
     )

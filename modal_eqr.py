@@ -214,21 +214,32 @@ def _split_has_samples(dataset_root: Path, split: str, min_samples: int) -> bool
     return int(metadata.get("total_samples", 0)) >= min_samples
 
 
-def _maze_dataset_ready(dataset_root: Path, min_samples: int) -> bool:
+def _maze_dataset_ready(dataset_root: Path, min_samples: int, expected_mode: Optional[str] = None) -> bool:
+    if expected_mode is not None:
+        config_path = dataset_root / "generation_config.json"
+        if not config_path.exists():
+            return False
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                generation_config = json.load(handle)
+        except Exception:
+            return False
+        if generation_config.get("maze_mode") != expected_mode:
+            return False
     return _split_has_samples(dataset_root, "train", min_samples) and _split_has_samples(dataset_root, "test", min_samples)
 
 
 def _ensure_maze_data(which: str = "both", *, smoke: bool = False) -> None:
     expected_unique = Path(REMOTE_REPO) / "data" / "maze-30x30-unique-1k"
     expected_multi = Path(REMOTE_REPO) / "data" / "maze-30x30-multi-1k"
-    expected = {"unique": expected_unique, "multi": expected_multi}
+    expected = {"unique": (expected_unique, "perfect"), "multi": (expected_multi, "direct_multi")}
     if which not in {"unique", "multi", "both"}:
         raise ValueError(f"unknown maze dataset selector: {which}")
 
     required = list(expected.values()) if which == "both" else [expected[which]]
     min_samples = 4 if smoke else 1000
-    if all(_maze_dataset_ready(path, min_samples) for path in required):
-        print(f"Maze data already present for {which}: {', '.join(map(str, required))}", flush=True)
+    if all(_maze_dataset_ready(path, min_samples, mode) for path, mode in required):
+        print(f"Maze data already present for {which}: {', '.join(str(path) for path, _ in required)}", flush=True)
         return
 
     cmd = ["python", "scripts/build_maze_datasets.py", "--which", which]
@@ -453,6 +464,8 @@ def _train_configs(
     checkpoint_interval_steps: Optional[int] = 1000,
     auto_resume: bool = True,
 ) -> None:
+    if len(configs) > 1:
+        _run(["python", "scripts/check_param_match.py", *configs, "--max-relative-gap", "0.02"])
     for config in configs:
         _ensure_data_for_config(config)
         checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
@@ -681,6 +694,139 @@ def pack_results(archive_name: str = "eqr_modal_outputs.tar.gz") -> dict[str, st
     }
 
 
+@app.function(
+    image=image,
+    timeout=60 * 10,
+    volumes={"/outputs": results_volume},
+)
+def summarize_results(dataset_filter: Optional[str] = None) -> list[dict[str, object]]:
+    rows = []
+    root = Path("/outputs/outputs")
+    if not root.exists():
+        print("No outputs directory found", flush=True)
+        return rows
+
+    for cfg_path in sorted(root.glob("*/*/*/all_config.yaml")):
+        try:
+            cfg = _load_yaml(cfg_path)
+        except Exception as exc:
+            print(f"Skipping unreadable config {cfg_path}: {exc}", flush=True)
+            continue
+
+        meta = cfg.get("wandb_meta", {}) or {}
+        dataset = (cfg.get("dataset", {}) or {}).get("name", "")
+        run_name = meta.get("name", "")
+        if dataset_filter:
+            needle = dataset_filter.lower()
+            if needle not in str(dataset).lower() and needle not in str(run_name).lower():
+                continue
+
+        steps = []
+        for ckpt in cfg_path.parent.glob("checkpoints/step_*.pth"):
+            step = _checkpoint_step(ckpt)
+            if step >= 0:
+                steps.append(step)
+
+        row = {
+            "run_id": cfg_path.parts[3],
+            "run_name": run_name,
+            "project": meta.get("project", ""),
+            "dataset": dataset,
+            "params": cfg.get("num_params"),
+            "max_step": max(steps) if steps else None,
+            "run_dir": str(cfg_path.parent),
+        }
+        rows.append(row)
+
+    print(
+        f"{'run_id':10s} {'max_step':>8s} {'params':>12s} {'project':28s} run_name",
+        flush=True,
+    )
+    for row in rows:
+        print(
+            f"{row['run_id']:10s} {str(row['max_step']):>8s} "
+            f"{str(row['params']):>12s} {str(row['project'])[:28]:28s} {row['run_name']}",
+            flush=True,
+        )
+    return rows
+
+
+@app.function(
+    image=image,
+    timeout=60 * 30,
+    volumes={"/outputs": results_volume},
+)
+def pack_sudoku_finals(
+    archive_name: str = "sudoku_final_checkpoints.tar.gz",
+    project_filter: Optional[str] = "all-datasets-all-models",
+) -> dict[str, object]:
+    root = Path("/outputs/outputs")
+    dst = Path("/outputs") / archive_name
+    if dst.exists():
+        dst.unlink()
+
+    selected: dict[str, tuple[int, Path, Path]] = {}
+    for cfg_path in sorted(root.glob("*/*/*/all_config.yaml")):
+        cfg = _load_yaml(cfg_path)
+        meta = cfg.get("wandb_meta", {}) or {}
+        run_name = str(meta.get("name", ""))
+        project = meta.get("project")
+        if "Sudoku" not in run_name:
+            continue
+        if project_filter is not None and project != project_filter:
+            continue
+        ckpts = [p for p in cfg_path.parent.glob("checkpoints/step_*.pth") if _checkpoint_step(p) >= 0]
+        if not ckpts:
+            continue
+        ckpt = max(ckpts, key=lambda p: _checkpoint_step(p))
+        step = _checkpoint_step(ckpt)
+        old = selected.get(run_name)
+        if old is None or step > old[0]:
+            selected[run_name] = (step, cfg_path, ckpt)
+
+    if not selected:
+        raise FileNotFoundError(f"No Sudoku final checkpoints found for project={project_filter!r}")
+
+    with tarfile.open(dst, "w:gz") as tar:
+        manifest = []
+        for run_name, (step, cfg_path, ckpt) in sorted(selected.items()):
+            run_dir = cfg_path.parent
+            run_id = run_dir.parts[3]
+            safe_name = run_name.replace("/", "_").replace(" ", "_")
+            prefix = f"{run_id}_{safe_name}"
+            tar.add(cfg_path, arcname=f"{prefix}/all_config.yaml")
+            tar.add(ckpt, arcname=f"{prefix}/{ckpt.name}")
+            for wandb_file in run_dir.glob("wandb/offline-run-*/*.wandb"):
+                tar.add(wandb_file, arcname=f"{prefix}/wandb/{wandb_file.name}")
+            for log_file in run_dir.glob("wandb/offline-run-*/files/output.log"):
+                tar.add(log_file, arcname=f"{prefix}/wandb/output.log")
+            manifest.append(
+                {
+                    "run_id": run_id,
+                    "run_name": run_name,
+                    "step": step,
+                    "checkpoint": str(ckpt),
+                    "run_dir": str(run_dir),
+                }
+            )
+
+        manifest_path = Path("/tmp/sudoku_final_manifest.json")
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+        tar.add(manifest_path, arcname="manifest.json")
+
+    results_volume.commit()
+    print(f"Packed {len(selected)} Sudoku final runs into {archive_name}", flush=True)
+    for item in manifest:
+        print(f"{item['run_id']:10s} step={item['step']:>6} {item['run_name']}", flush=True)
+    return {
+        "status": "ok",
+        "archive": archive_name,
+        "runs": manifest,
+        "download": f"modal volume get {RESULTS_VOLUME} {archive_name} ./{archive_name}",
+    }
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "smoke",
@@ -707,12 +853,16 @@ def main(
         result = train_all_datasets_8gpu.remote(max_steps=max_steps, disable_compile=disable_compile, start_config=start_config, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     elif mode in {"pack", "pack-results"}:
         result = pack_results.remote()
+    elif mode in {"summary", "summarize", "summarize-results"}:
+        result = summarize_results.remote(dataset_filter=config if config != "lg_prm_noisy_soft_sudoku" else None)
+    elif mode in {"pack-sudoku-finals", "pack_sudoku_finals"}:
+        result = pack_sudoku_finals.remote()
     elif mode == "smoke":
         result = smoke.remote(config=config)
     elif mode == "train":
         result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     else:
-        raise ValueError("mode must be one of: smoke, train, all, all8, maze, maze8, all-datasets, all-datasets8, pack")
+        raise ValueError("mode must be one of: smoke, train, all, all8, maze, maze8, all-datasets, all-datasets8, pack, summarize-results, pack-sudoku-finals")
 
     print(result)
     print()

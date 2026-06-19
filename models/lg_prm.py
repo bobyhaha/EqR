@@ -224,13 +224,19 @@ class InnerNetwork(nn.Module):
 
     def _pool_proposals(self, state: torch.Tensor, proposals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mode = self.config.proposal_pool.lower()
-        if mode != "concat":
-            raise ValueError(f"LG-PRM no-pool path requires proposal_pool=concat, got {self.config.proposal_pool!r}")
         if proposals.ndim != 4:
-            raise ValueError("proposal_pool=concat requires token workspace proposals shaped [B, n_explorers, L, d]")
-        b, n, l, d = proposals.shape
-        attn = proposals.new_full(proposals.shape[:-1], 1.0 / n)
-        return proposals.permute(0, 2, 1, 3).reshape(b, l, n * d), attn
+            raise ValueError("LG-PRM requires token workspace proposals shaped [B, n_explorers, L, d]")
+        if mode == "concat":
+            b, n, l, d = proposals.shape
+            attn = proposals.new_full(proposals.shape[:-1], 1.0 / n)
+            return proposals.permute(0, 2, 1, 3).reshape(b, l, n * d), attn
+        if mode == "attention":
+            query = rms_norm(state, self.config.rms_norm_eps).unsqueeze(1)
+            keys = rms_norm(proposals, self.config.rms_norm_eps)
+            scores = (query * keys).sum(dim=-1) / math.sqrt(proposals.shape[-1])
+            attn = F.softmax(scores, dim=1)
+            return (attn.unsqueeze(-1) * proposals).sum(dim=1), attn
+        raise ValueError(f"Unknown proposal_pool: {self.config.proposal_pool}")
 
     def _proposal_diversity(self, proposals: torch.Tensor) -> torch.Tensor:
         if proposals.shape[1] <= 1:
@@ -461,4 +467,14 @@ class LGPRMConcatModel(LGPRMModel):
     def __init__(self, config_dict: dict) -> None:
         config_dict = dict(config_dict)
         config_dict["proposal_pool"] = "concat"
+        super().__init__(config_dict)
+
+
+class LGPRMAttentionModel(LGPRMModel):
+    gate_mode = "hard"
+    phd_noise_scale = 0.0
+
+    def __init__(self, config_dict: dict) -> None:
+        config_dict = dict(config_dict)
+        config_dict["proposal_pool"] = "attention"
         super().__init__(config_dict)

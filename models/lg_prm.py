@@ -162,6 +162,11 @@ class InnerNetwork(nn.Module):
         self.embed_tokens = CastedEmbedding(config.vocab_size, d, 1.0 / self.embed_scale, self.forward_dtype)
         self.state_init = CastedLinear(d, d, bias=True)
         self.explorers = ExplorerBank(config)
+        self.proposal_concat = (
+            CastedLinear(config.n_explorers * d, d, bias=True)
+            if config.proposal_pool.lower() == "concat"
+            else None
+        )
         self.rag_library = RAGLibrary(config) if config.use_library else None
         self.mlp_library = MLPLibrary(config) if config.use_library else None
         self.gate = Gate(config) if config.use_library else None
@@ -179,6 +184,11 @@ class InnerNetwork(nn.Module):
         if mode == "mean":
             attn = proposals.new_full(proposals.shape[:2], 1.0 / proposals.shape[1])
             return proposals.mean(dim=1), attn
+        if mode == "concat":
+            if self.proposal_concat is None:
+                raise RuntimeError("proposal_concat is not initialized")
+            attn = proposals.new_full(proposals.shape[:2], 1.0 / proposals.shape[1])
+            return self.proposal_concat(proposals.reshape(proposals.shape[0], -1)), attn
         if mode != "attention":
             raise ValueError(f"Unknown proposal_pool: {self.config.proposal_pool}")
 
@@ -197,6 +207,13 @@ class InnerNetwork(nn.Module):
         off_diag = sim.masked_fill(eye, 0.0)
         denom = proposals.shape[1] * (proposals.shape[1] - 1)
         return (off_diag.square().sum(dim=(1, 2)) / denom).mean()
+
+    def _proposal_usage_stats(self, proposal_attn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        usage = proposal_attn.to(torch.float32).mean(dim=0)
+        usage_entropy = -(usage * usage.clamp_min(1e-8).log()).sum()
+        effective_used = usage_entropy.exp().clamp(max=float(proposal_attn.shape[-1]))
+        load_balance = proposal_attn.shape[-1] * usage.square().sum() - 1.0
+        return effective_used, load_balance
 
     def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_scale * self.embed_tokens(input_ids.to(torch.int32))
@@ -239,11 +256,16 @@ class InnerNetwork(nn.Module):
         entropies = []
         proposal_entropies = []
         proposal_diversities = []
+        effective_phds = []
+        load_balance_losses = []
         for _ in range(self.config.lg_steps):
             proposals = self.explorers(state, xs)
             proposal, proposal_attn = self._pool_proposals(state, proposals)
             proposal_entropies.append((-(proposal_attn * proposal_attn.clamp_min(1e-8).log()).sum(dim=-1)).to(torch.float32).mean())
             proposal_diversities.append(self._proposal_diversity(proposals))
+            effective_used, load_balance = self._proposal_usage_stats(proposal_attn)
+            effective_phds.append(effective_used)
+            load_balance_losses.append(load_balance)
             if self.config.use_library:
                 gate_prob = self.gate(state, xs)
                 gate = self._gate_value(gate_prob)
@@ -265,6 +287,8 @@ class InnerNetwork(nn.Module):
             "library_entropy": torch.stack(entropies).mean() if entropies else state.new_tensor(0.0, dtype=torch.float32),
             "proposal_entropy": torch.stack(proposal_entropies).mean() if proposal_entropies else state.new_tensor(0.0, dtype=torch.float32),
             "proposal_diversity_loss": torch.stack(proposal_diversities).mean() if proposal_diversities else state.new_tensor(0.0, dtype=torch.float32),
+            "effective_phds_used": torch.stack(effective_phds).mean() if effective_phds else state.new_tensor(0.0, dtype=torch.float32),
+            "proposal_load_balance_loss": torch.stack(load_balance_losses).mean() if load_balance_losses else state.new_tensor(0.0, dtype=torch.float32),
         }
         if self.config.recurrent_update.lower() == "legacy":
             z_H = token_features + state.unsqueeze(1)
@@ -384,4 +408,14 @@ class LGPRMNoLibraryModel(LGPRMModel):
     def __init__(self, config_dict: dict) -> None:
         config_dict = dict(config_dict)
         config_dict["use_library"] = False
+        super().__init__(config_dict)
+
+
+class LGPRMConcatModel(LGPRMModel):
+    gate_mode = "hard"
+    phd_noise_scale = 0.0
+
+    def __init__(self, config_dict: dict) -> None:
+        config_dict = dict(config_dict)
+        config_dict["proposal_pool"] = "concat"
         super().__init__(config_dict)

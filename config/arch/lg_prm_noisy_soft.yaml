@@ -5,6 +5,7 @@ loss:
   loss_type: stablemax_cross_entropy
   proposal_diversity_weight: 0.01
   proposal_entropy_weight: 0.001
+  proposal_load_balance_weight: 0.01
   library_entropy_weight: 0.001
 
 halt_exploration_prob: 0.1

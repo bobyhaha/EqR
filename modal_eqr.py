@@ -20,6 +20,7 @@ DATA_VOLUME = "eqr-lg-prm-data"
 # Keep B200 out of runtime fallback until the image moves to a PyTorch/CUDA build
 # that explicitly supports sm_100.
 GPU_FALLBACKS = ["H200", "H100"]
+GPU5_FALLBACKS = ["H200:5", "H100:5"]
 GPU8_FALLBACKS = ["H200:8", "H100:8"]
 BUILD_GPU = "B200"
 CUDA_BUILD_ENV = {
@@ -33,6 +34,7 @@ SUDOKU_CONFIGS = [
     "eqr_sudoku",
     "trm_sudoku",
     "lg_prm_hard_sudoku",
+    "lg_prm_concat_sudoku",
     "lg_prm_soft_sudoku",
     "lg_prm_noisy_hard_sudoku",
     "lg_prm_noisy_soft_sudoku",
@@ -43,6 +45,7 @@ MAZE_UNIQUE_CONFIGS = [
     "eqr_maze_unique",
     "trm_maze_unique",
     "lg_prm_hard_maze_unique",
+    "lg_prm_concat_maze_unique",
     "lg_prm_soft_maze_unique",
     "lg_prm_noisy_hard_maze_unique",
     "lg_prm_noisy_soft_maze_unique",
@@ -53,6 +56,7 @@ MAZE_MULTI_CONFIGS = [
     "eqr_maze_multi",
     "trm_maze_multi",
     "lg_prm_hard_maze_multi",
+    "lg_prm_concat_maze_multi",
     "lg_prm_soft_maze_multi",
     "lg_prm_noisy_hard_maze_multi",
     "lg_prm_noisy_soft_maze_multi",
@@ -452,6 +456,109 @@ def train_config(
     finally:
         _commit_volumes()
     return {"status": "ok", "config": config, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU5_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_config_5gpu(
+    config: str,
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
+) -> dict[str, object]:
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", config])
+        _ensure_data_for_config(config)
+        env = {"NPROC_PER_NODE": "5"}
+        if disable_compile:
+            env["DISABLE_COMPILE"] = "1"
+        checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
+        if checkpoint is not None:
+            print(f"Resuming {config} from {checkpoint}", flush=True)
+        _run_with_periodic_result_commits(
+            [
+                "bash",
+                "scripts/train.sh",
+                config,
+                *_train_overrides(
+                    max_steps,
+                    smoke=False,
+                    disable_compile=disable_compile,
+                    skip_eval=skip_eval,
+                    experiment_name=experiment_name,
+                    checkpoint_interval_steps=checkpoint_interval_steps,
+                    load_checkpoint=checkpoint,
+                ),
+                "++global_batch_size=770",
+            ],
+            env=env,
+            commit_interval_seconds=60,
+        )
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "config": config, "gpus": 5, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
+
+
+@app.function(
+    image=image,
+    gpu=GPU8_FALLBACKS,
+    timeout=60 * 60 * 24,
+    volumes={
+        "/outputs": results_volume,
+        f"{REMOTE_REPO}/data": data_volume,
+    },
+)
+def train_config_8gpu(
+    config: str,
+    max_steps: Optional[int] = None,
+    disable_compile: bool = False,
+    skip_eval: bool = False,
+    experiment_name: Optional[str] = None,
+    checkpoint_interval_steps: Optional[int] = 1000,
+    auto_resume: bool = True,
+) -> dict[str, object]:
+    try:
+        _run(["nvidia-smi"])
+        _run(["python", "scripts/print_model_params.py", config])
+        _ensure_data_for_config(config)
+        env = {"NPROC_PER_NODE": "8"}
+        if disable_compile:
+            env["DISABLE_COMPILE"] = "1"
+        checkpoint = _latest_checkpoint_for_config(config, experiment_name) if auto_resume else None
+        if checkpoint is not None:
+            print(f"Resuming {config} from {checkpoint}", flush=True)
+        _run_with_periodic_result_commits(
+            [
+                "bash",
+                "scripts/train.sh",
+                config,
+                *_train_overrides(
+                    max_steps,
+                    smoke=False,
+                    disable_compile=disable_compile,
+                    skip_eval=skip_eval,
+                    experiment_name=experiment_name,
+                    checkpoint_interval_steps=checkpoint_interval_steps,
+                    load_checkpoint=checkpoint,
+                ),
+            ],
+            env=env,
+            commit_interval_seconds=60,
+        )
+    finally:
+        _commit_volumes()
+    return {"status": "ok", "config": config, "gpus": 8, "experiment_name": experiment_name, "results_volume": RESULTS_VOLUME}
 
 
 def _train_configs(
@@ -861,8 +968,12 @@ def main(
         result = smoke.remote(config=config)
     elif mode == "train":
         result = train_config.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
+    elif mode == "train5":
+        result = train_config_5gpu.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
+    elif mode == "train8":
+        result = train_config_8gpu.remote(config=config, max_steps=max_steps, disable_compile=disable_compile, skip_eval=skip_eval, experiment_name=experiment_name, checkpoint_interval_steps=checkpoint_interval_steps, auto_resume=auto_resume)
     else:
-        raise ValueError("mode must be one of: smoke, train, all, all8, maze, maze8, all-datasets, all-datasets8, pack, summarize-results, pack-sudoku-finals")
+        raise ValueError("mode must be one of: smoke, train, train5, train8, all, all8, maze, maze8, all-datasets, all-datasets8, pack, summarize-results, pack-sudoku-finals")
 
     print(result)
     print()

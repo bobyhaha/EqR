@@ -49,6 +49,7 @@ class ACTLossHead(BaseLossHead):
         loss_type: str,
         proposal_diversity_weight: float = 0.0,
         proposal_entropy_weight: float = 0.0,
+        proposal_load_balance_weight: float = 0.0,
         library_entropy_weight: float = 0.0,
         **kwargs: Any,
     ) -> None:
@@ -59,6 +60,7 @@ class ACTLossHead(BaseLossHead):
         self.loss_fn = globals()[loss_type]
         self.proposal_diversity_weight = float(proposal_diversity_weight)
         self.proposal_entropy_weight = float(proposal_entropy_weight)
+        self.proposal_load_balance_weight = float(proposal_load_balance_weight)
         self.library_entropy_weight = float(library_entropy_weight)
 
     def initial_carry(self, *args: Any, **kwargs: Any) -> Any:
@@ -142,6 +144,10 @@ class ACTLossHead(BaseLossHead):
         if self.proposal_entropy_weight and isinstance(proposal_entropy, torch.Tensor):
             aux_loss = aux_loss - self.proposal_entropy_weight * proposal_entropy.to(aux_loss.dtype) * aux_scale
             metrics["proposal_entropy_bonus"] = proposal_entropy.detach()
+        proposal_load_balance = outputs.get("proposal_load_balance_loss")
+        if self.proposal_load_balance_weight and isinstance(proposal_load_balance, torch.Tensor):
+            aux_loss = aux_loss + self.proposal_load_balance_weight * proposal_load_balance.to(aux_loss.dtype) * aux_scale
+            metrics["proposal_load_balance_aux"] = proposal_load_balance.detach()
         library_entropy = outputs.get("library_entropy")
         if self.library_entropy_weight and isinstance(library_entropy, torch.Tensor):
             aux_loss = aux_loss - self.library_entropy_weight * library_entropy.to(aux_loss.dtype) * aux_scale
@@ -236,10 +242,19 @@ class ACTLossHead(BaseLossHead):
                     ),
                 }
             )
-        for key in ("gate_mean", "hard_gate_mean", "library_entropy", "proposal_entropy", "proposal_diversity_loss"):
+        metric_scale = count.clamp_min(1).to(dtype=torch.float32)
+        for key in (
+            "gate_mean",
+            "hard_gate_mean",
+            "library_entropy",
+            "proposal_entropy",
+            "proposal_diversity_loss",
+            "effective_phds_used",
+            "proposal_load_balance_loss",
+        ):
             value = outputs.get(key)
             if isinstance(value, torch.Tensor):
-                metrics[key] = value.to(dtype=torch.float32) * count.to(dtype=torch.float32)
+                metrics[key] = value.to(dtype=torch.float32) * metric_scale
         return metrics
 
     def _zh_zl_metrics(self, carry: Any, count: torch.Tensor) -> Dict[str, torch.Tensor]:

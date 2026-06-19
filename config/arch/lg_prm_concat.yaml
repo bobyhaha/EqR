@@ -1,17 +1,17 @@
-name: lg_prm@LGPRMHardModel
-short_name: LG-PRM-Hard
+name: lg_prm@LGPRMConcatModel
+short_name: LG-PRM-Concat
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
   proposal_diversity_weight: 0.01
-  proposal_entropy_weight: 0.001
-  proposal_load_balance_weight: 0.01
+  proposal_entropy_weight: 0.0
+  proposal_load_balance_weight: 0.0
   library_entropy_weight: 0.001
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
 
-hidden_size: 296
+hidden_size: 280
 num_heads: 8
 expansion: 4
 forward_dtype: bfloat16
@@ -26,7 +26,7 @@ mlp_library_mult: 4
 gate_threshold: 0.5
 straight_through_gate: true
 forced_library: false
-proposal_pool: attention
+proposal_pool: concat
 recurrent_update: residual
 phd_lambda: 0.95
 phd_noise_scale: 0.0

@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from models.common import trunc_normal_init_
-from models.layers import CastedEmbedding, CastedLinear, SwiGLU, rms_norm
+from models.layers import Attention, CastedEmbedding, CastedLinear, SwiGLU, rms_norm
 
 
 @dataclass
@@ -56,6 +56,7 @@ class LGPRMConfig(BaseModel):
     use_library: bool = True
     proposal_pool: str = "attention"
     recurrent_update: str = "residual"
+    workspace: str = "token"
 
     phd_lambda: float = 0.95
     phd_noise_scale: float = 0.0
@@ -136,19 +137,39 @@ class Gate(nn.Module):
         return torch.sigmoid(self.down(F.gelu(self.up(rms_norm(x, self.config.rms_norm_eps)))))
 
 
+class PIBlock(nn.Module):
+    def __init__(self, config: LGPRMConfig) -> None:
+        super().__init__()
+        d = config.hidden_size
+        self.config = config
+        self.self_attn = Attention(
+            hidden_size=d,
+            head_dim=d // config.num_heads,
+            num_heads=config.num_heads,
+            num_key_value_heads=config.num_heads,
+            causal=False,
+        )
+        self.mlp = SwiGLU(d, config.expansion)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = rms_norm(hidden_states + self.self_attn(None, hidden_states), self.config.rms_norm_eps)
+        return rms_norm(hidden_states + self.mlp(hidden_states), self.config.rms_norm_eps)
+
+
 class PIModule(nn.Module):
     def __init__(self, config: LGPRMConfig) -> None:
         super().__init__()
         self.config = config
         d = config.hidden_size
-        self.in_proj = CastedLinear(4 * d, d, bias=True)
-        self.layers = nn.ModuleList([SwiGLU(d, config.expansion) for _ in range(config.pi_layers)])
+        proposal_width = config.n_explorers * d if config.proposal_pool.lower() == "concat" else d
+        self.in_proj = CastedLinear(3 * d + proposal_width, d, bias=True)
+        self.layers = nn.ModuleList([PIBlock(config) for _ in range(config.pi_layers)])
         self.out = CastedLinear(d, d, bias=True)
 
     def forward(self, state: torch.Tensor, xs: torch.Tensor, proposal: torch.Tensor, libvec: torch.Tensor) -> torch.Tensor:
         z = self.in_proj(torch.cat([state, xs, proposal, libvec], dim=-1))
         for layer in self.layers:
-            z = rms_norm(z + layer(z), self.config.rms_norm_eps)
+            z = layer(z)
         return state + self.out(rms_norm(z, self.config.rms_norm_eps))
 
 
@@ -162,11 +183,6 @@ class InnerNetwork(nn.Module):
         self.embed_tokens = CastedEmbedding(config.vocab_size, d, 1.0 / self.embed_scale, self.forward_dtype)
         self.state_init = CastedLinear(d, d, bias=True)
         self.explorers = ExplorerBank(config)
-        self.proposal_concat = (
-            CastedLinear(config.n_explorers * d, d, bias=True)
-            if config.proposal_pool.lower() == "concat"
-            else None
-        )
         self.rag_library = RAGLibrary(config) if config.use_library else None
         self.mlp_library = MLPLibrary(config) if config.use_library else None
         self.gate = Gate(config) if config.use_library else None
@@ -181,38 +197,49 @@ class InnerNetwork(nn.Module):
 
     def _pool_proposals(self, state: torch.Tensor, proposals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mode = self.config.proposal_pool.lower()
+        proposal_dim = 1
         if mode == "mean":
-            attn = proposals.new_full(proposals.shape[:2], 1.0 / proposals.shape[1])
-            return proposals.mean(dim=1), attn
+            attn_shape = proposals.shape[:-1]
+            attn = proposals.new_full(attn_shape, 1.0 / proposals.shape[proposal_dim])
+            return proposals.mean(dim=proposal_dim), attn
         if mode == "concat":
-            if self.proposal_concat is None:
-                raise RuntimeError("proposal_concat is not initialized")
-            attn = proposals.new_full(proposals.shape[:2], 1.0 / proposals.shape[1])
-            return self.proposal_concat(proposals.reshape(proposals.shape[0], -1)), attn
+            attn_shape = proposals.shape[:-1]
+            attn = proposals.new_full(attn_shape, 1.0 / proposals.shape[proposal_dim])
+            if proposals.ndim != 4:
+                raise ValueError("proposal_pool=concat requires token workspace proposals shaped [B, n_explorers, L, d]")
+            b, n, l, d = proposals.shape
+            return proposals.permute(0, 2, 1, 3).reshape(b, l, n * d), attn
         if mode != "attention":
             raise ValueError(f"Unknown proposal_pool: {self.config.proposal_pool}")
 
         query = rms_norm(state, self.config.rms_norm_eps).unsqueeze(1)
         keys = rms_norm(proposals, self.config.rms_norm_eps)
         scores = (query * keys).sum(dim=-1) / math.sqrt(proposals.shape[-1])
-        attn = F.softmax(scores, dim=-1)
+        attn = F.softmax(scores, dim=1)
         return (attn.unsqueeze(-1) * proposals).sum(dim=1), attn
 
     def _proposal_diversity(self, proposals: torch.Tensor) -> torch.Tensor:
         if proposals.shape[1] <= 1:
             return proposals.new_tensor(0.0, dtype=torch.float32)
         p = F.normalize(proposals.to(torch.float32), dim=-1)
-        sim = p @ p.transpose(1, 2)
-        eye = torch.eye(sim.shape[-1], dtype=torch.bool, device=sim.device).unsqueeze(0)
+        if proposals.ndim == 4:
+            p = p.permute(0, 2, 1, 3)
+            sim = p @ p.transpose(-1, -2)
+        else:
+            sim = p @ p.transpose(1, 2)
+        eye = torch.eye(sim.shape[-1], dtype=torch.bool, device=sim.device)
+        eye = eye.view(1, 1, sim.shape[-1], sim.shape[-1]) if sim.ndim == 4 else eye.unsqueeze(0)
         off_diag = sim.masked_fill(eye, 0.0)
         denom = proposals.shape[1] * (proposals.shape[1] - 1)
-        return (off_diag.square().sum(dim=(1, 2)) / denom).mean()
+        return (off_diag.square().sum(dim=(-1, -2)) / denom).mean()
 
     def _proposal_usage_stats(self, proposal_attn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        usage = proposal_attn.to(torch.float32).mean(dim=0)
+        reduce_dims = (0, 2) if proposal_attn.ndim == 3 else 0
+        usage = proposal_attn.to(torch.float32).mean(dim=reduce_dims)
         usage_entropy = -(usage * usage.clamp_min(1e-8).log()).sum()
-        effective_used = usage_entropy.exp().clamp(max=float(proposal_attn.shape[-1]))
-        load_balance = proposal_attn.shape[-1] * usage.square().sum() - 1.0
+        n_explorers = proposal_attn.shape[1]
+        effective_used = usage_entropy.exp().clamp(max=float(n_explorers))
+        load_balance = n_explorers * usage.square().sum() - 1.0
         return effective_used, load_balance
 
     def _input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -248,9 +275,9 @@ class InnerNetwork(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         token_features = self._input_embeddings(batch["inputs"])
-        xs = token_features.mean(dim=1)
-        carried_tokens = rms_norm(z_H + token_features, self.config.rms_norm_eps)
-        state = self.state_init(carried_tokens.mean(dim=1))
+        xs = token_features
+        carried_tokens = rms_norm(z_H + z_L + token_features, self.config.rms_norm_eps)
+        state = self.state_init(carried_tokens)
         gate_values = []
         hard_values = []
         entropies = []
@@ -261,7 +288,7 @@ class InnerNetwork(nn.Module):
         for _ in range(self.config.lg_steps):
             proposals = self.explorers(state, xs)
             proposal, proposal_attn = self._pool_proposals(state, proposals)
-            proposal_entropies.append((-(proposal_attn * proposal_attn.clamp_min(1e-8).log()).sum(dim=-1)).to(torch.float32).mean())
+            proposal_entropies.append((-(proposal_attn * proposal_attn.clamp_min(1e-8).log()).sum(dim=1)).to(torch.float32).mean())
             proposal_diversities.append(self._proposal_diversity(proposals))
             effective_used, load_balance = self._proposal_usage_stats(proposal_attn)
             effective_phds.append(effective_used)
@@ -291,14 +318,15 @@ class InnerNetwork(nn.Module):
             "proposal_load_balance_loss": torch.stack(load_balance_losses).mean() if load_balance_losses else state.new_tensor(0.0, dtype=torch.float32),
         }
         if self.config.recurrent_update.lower() == "legacy":
-            z_H = token_features + state.unsqueeze(1)
+            z_H = token_features + state
         elif self.config.recurrent_update.lower() == "residual":
-            z_H = rms_norm(carried_tokens + state.unsqueeze(1), self.config.rms_norm_eps)
+            z_H = rms_norm(carried_tokens + state, self.config.rms_norm_eps)
         else:
             raise ValueError(f"Unknown recurrent_update: {self.config.recurrent_update}")
-        z_L = token_features
+        z_L = rms_norm(z_L + token_features, self.config.rms_norm_eps)
         logits = self.lm_head(rms_norm(z_H, self.config.rms_norm_eps))
-        q = self.q_head(rms_norm(state, self.config.rms_norm_eps)).to(torch.float32)
+        q_state = state[:, 0] if state.ndim == 3 else state
+        q = self.q_head(rms_norm(q_state, self.config.rms_norm_eps)).to(torch.float32)
         return (z_H, z_L), logits, (q[..., 0], q[..., 1]), diagnostics
 
     def forward(self, carry: LatentCarry, batch: Dict[str, torch.Tensor]) -> Tuple[LatentCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:

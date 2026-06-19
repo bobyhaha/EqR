@@ -11,7 +11,7 @@ loss:
 halt_exploration_prob: 0.1
 halt_max_steps: 16
 
-hidden_size: 280
+hidden_size: 264
 num_heads: 8
 expansion: 4
 forward_dtype: bfloat16

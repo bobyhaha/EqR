@@ -210,7 +210,16 @@ class InnerNetwork(nn.Module):
 
     def _init_pos(self) -> None:
         pos = self.config.pos_encodings
+        if self.config.hidden_size % self.config.num_heads != 0:
+            raise ValueError(
+                f"hidden_size={self.config.hidden_size} must be divisible by num_heads={self.config.num_heads}"
+            )
         head_dim = self.config.hidden_size // self.config.num_heads
+        if pos in {"rope", "rope2d"} and head_dim % 2 != 0:
+            raise ValueError(
+                f"{pos} requires an even attention head_dim; got hidden_size={self.config.hidden_size}, "
+                f"num_heads={self.config.num_heads}, head_dim={head_dim}"
+            )
         if pos == "rope":
             self.rotary_emb = RotaryEmbedding(head_dim, self.config.seq_len, self.config.rope_theta)
         elif pos == "rope2d":

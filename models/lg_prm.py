@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from models.common import trunc_normal_init_
-from models.layers import Attention, CastedEmbedding, CastedLinear, SwiGLU, rms_norm
+from models.layers import Attention, CastedEmbedding, CastedLinear, CosSin, RotaryEmbedding, RotaryEmbedding2D, SwiGLU, rms_norm
 
 
 @dataclass
@@ -54,9 +54,13 @@ class LGPRMConfig(BaseModel):
     straight_through_gate: bool = True
     forced_library: bool = False
     use_library: bool = True
-    proposal_pool: str = "attention"
+    proposal_pool: str = "concat"
     recurrent_update: str = "residual"
     workspace: str = "token"
+    pos_encodings: Optional[str] = "rope2d"
+    rope_theta: float = 10000.0
+    board_height: Optional[int] = None
+    board_width: Optional[int] = None
 
     phd_lambda: float = 0.95
     phd_noise_scale: float = 0.0
@@ -151,8 +155,8 @@ class PIBlock(nn.Module):
         )
         self.mlp = SwiGLU(d, config.expansion)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = rms_norm(hidden_states + self.self_attn(None, hidden_states), self.config.rms_norm_eps)
+    def forward(self, hidden_states: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin, hidden_states), self.config.rms_norm_eps)
         return rms_norm(hidden_states + self.mlp(hidden_states), self.config.rms_norm_eps)
 
 
@@ -166,10 +170,10 @@ class PIModule(nn.Module):
         self.layers = nn.ModuleList([PIBlock(config) for _ in range(config.pi_layers)])
         self.out = CastedLinear(d, d, bias=True)
 
-    def forward(self, state: torch.Tensor, xs: torch.Tensor, proposal: torch.Tensor, libvec: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor, xs: torch.Tensor, proposal: torch.Tensor, libvec: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
         z = self.in_proj(torch.cat([state, xs, proposal, libvec], dim=-1))
         for layer in self.layers:
-            z = layer(z)
+            z = layer(z, cos_sin)
         return state + self.out(rms_norm(z, self.config.rms_norm_eps))
 
 
@@ -187,6 +191,7 @@ class InnerNetwork(nn.Module):
         self.mlp_library = MLPLibrary(config) if config.use_library else None
         self.gate = Gate(config) if config.use_library else None
         self.pi = PIModule(config)
+        self._init_pos()
         self.lm_head = CastedLinear(d, config.vocab_size, bias=False)
         self.q_head = CastedLinear(d, 2, bias=True)
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(d, dtype=self.forward_dtype), std=config.H_init_std), persistent=True)
@@ -195,28 +200,37 @@ class InnerNetwork(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
 
+    def _board_dims(self) -> Tuple[int, int]:
+        if self.config.board_height is not None and self.config.board_width is not None:
+            return self.config.board_height, self.config.board_width
+        board_size = int(self.config.seq_len**0.5)
+        if board_size * board_size != self.config.seq_len:
+            raise ValueError(f"seq_len {self.config.seq_len} is not a perfect square. Specify board_height and board_width explicitly.")
+        return board_size, board_size
+
+    def _init_pos(self) -> None:
+        pos = self.config.pos_encodings
+        head_dim = self.config.hidden_size // self.config.num_heads
+        if pos == "rope":
+            self.rotary_emb = RotaryEmbedding(head_dim, self.config.seq_len, self.config.rope_theta)
+        elif pos == "rope2d":
+            h, w = self._board_dims()
+            self.rotary_emb = RotaryEmbedding2D(head_dim, h, w, self.config.rope_theta)
+        elif pos not in {"none", None}:
+            raise ValueError(f"Unknown pos_encodings '{pos}'")
+
+    def _cos_sin(self) -> CosSin:
+        return self.rotary_emb() if hasattr(self, "rotary_emb") else None
+
     def _pool_proposals(self, state: torch.Tensor, proposals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mode = self.config.proposal_pool.lower()
-        proposal_dim = 1
-        if mode == "mean":
-            attn_shape = proposals.shape[:-1]
-            attn = proposals.new_full(attn_shape, 1.0 / proposals.shape[proposal_dim])
-            return proposals.mean(dim=proposal_dim), attn
-        if mode == "concat":
-            attn_shape = proposals.shape[:-1]
-            attn = proposals.new_full(attn_shape, 1.0 / proposals.shape[proposal_dim])
-            if proposals.ndim != 4:
-                raise ValueError("proposal_pool=concat requires token workspace proposals shaped [B, n_explorers, L, d]")
-            b, n, l, d = proposals.shape
-            return proposals.permute(0, 2, 1, 3).reshape(b, l, n * d), attn
-        if mode != "attention":
-            raise ValueError(f"Unknown proposal_pool: {self.config.proposal_pool}")
-
-        query = rms_norm(state, self.config.rms_norm_eps).unsqueeze(1)
-        keys = rms_norm(proposals, self.config.rms_norm_eps)
-        scores = (query * keys).sum(dim=-1) / math.sqrt(proposals.shape[-1])
-        attn = F.softmax(scores, dim=1)
-        return (attn.unsqueeze(-1) * proposals).sum(dim=1), attn
+        if mode != "concat":
+            raise ValueError(f"LG-PRM no-pool path requires proposal_pool=concat, got {self.config.proposal_pool!r}")
+        if proposals.ndim != 4:
+            raise ValueError("proposal_pool=concat requires token workspace proposals shaped [B, n_explorers, L, d]")
+        b, n, l, d = proposals.shape
+        attn = proposals.new_full(proposals.shape[:-1], 1.0 / n)
+        return proposals.permute(0, 2, 1, 3).reshape(b, l, n * d), attn
 
     def _proposal_diversity(self, proposals: torch.Tensor) -> torch.Tensor:
         if proposals.shape[1] <= 1:
@@ -285,6 +299,7 @@ class InnerNetwork(nn.Module):
         proposal_diversities = []
         effective_phds = []
         load_balance_losses = []
+        cos_sin = self._cos_sin()
         for _ in range(self.config.lg_steps):
             proposals = self.explorers(state, xs)
             proposal, proposal_attn = self._pool_proposals(state, proposals)
@@ -307,7 +322,7 @@ class InnerNetwork(nn.Module):
                 gate_values.append(state.new_tensor(0.0, dtype=torch.float32))
                 hard_values.append(state.new_tensor(0.0, dtype=torch.float32))
                 entropies.append(state.new_tensor(0.0, dtype=torch.float32))
-            state = self.pi(state, xs, proposal, libvec)
+            state = self.pi(state, xs, proposal, libvec, cos_sin)
         diagnostics = {
             "gate_mean": torch.stack(gate_values).mean() if gate_values else state.new_tensor(0.0, dtype=torch.float32),
             "hard_gate_mean": torch.stack(hard_values).mean() if hard_values else state.new_tensor(0.0, dtype=torch.float32),
@@ -323,7 +338,7 @@ class InnerNetwork(nn.Module):
             z_H = rms_norm(carried_tokens + state, self.config.rms_norm_eps)
         else:
             raise ValueError(f"Unknown recurrent_update: {self.config.recurrent_update}")
-        z_L = rms_norm(z_L + token_features, self.config.rms_norm_eps)
+        z_L = rms_norm(z_L + state + token_features, self.config.rms_norm_eps)
         logits = self.lm_head(rms_norm(z_H, self.config.rms_norm_eps))
         q_state = state[:, 0] if state.ndim == 3 else state
         q = self.q_head(rms_norm(q_state, self.config.rms_norm_eps)).to(torch.float32)

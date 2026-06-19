@@ -13,6 +13,7 @@ halt_max_steps: 16
 
 hidden_size: 264
 num_heads: 8
+pos_encodings: rope2d
 expansion: 4
 forward_dtype: bfloat16
 

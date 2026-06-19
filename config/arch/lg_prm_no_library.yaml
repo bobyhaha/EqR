@@ -11,8 +11,9 @@ loss:
 halt_exploration_prob: 0.1
 halt_max_steps: 16
 
-hidden_size: 280
+hidden_size: 272
 num_heads: 8
+pos_encodings: rope2d
 expansion: 4
 forward_dtype: bfloat16
 
@@ -26,7 +27,7 @@ mlp_library_mult: 4
 gate_threshold: 0.5
 straight_through_gate: true
 forced_library: false
-proposal_pool: attention
+proposal_pool: concat
 recurrent_update: residual
 phd_lambda: 0.95
 phd_noise_scale: 0.0

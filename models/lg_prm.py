@@ -215,9 +215,14 @@ class InnerNetwork(nn.Module):
                 f"hidden_size={self.config.hidden_size} must be divisible by num_heads={self.config.num_heads}"
             )
         head_dim = self.config.hidden_size // self.config.num_heads
-        if pos in {"rope", "rope2d"} and head_dim % 2 != 0:
+        if pos == "rope" and head_dim % 2 != 0:
             raise ValueError(
-                f"{pos} requires an even attention head_dim; got hidden_size={self.config.hidden_size}, "
+                f"rope requires an even attention head_dim; got hidden_size={self.config.hidden_size}, "
+                f"num_heads={self.config.num_heads}, head_dim={head_dim}"
+            )
+        if pos == "rope2d" and head_dim % 4 != 0:
+            raise ValueError(
+                f"rope2d requires attention head_dim divisible by 4; got hidden_size={self.config.hidden_size}, "
                 f"num_heads={self.config.num_heads}, head_dim={head_dim}"
             )
         if pos == "rope":

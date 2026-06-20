@@ -421,6 +421,7 @@ class LGPRMModel(nn.Module):
             is_last = steps >= self.config.halt_max_steps
             halted = is_last
             if self.training and self.config.halt_max_steps > 1:
+                halted = halted | (q_halt > float(self.config.halt_threshold))
                 min_steps = (torch.rand_like(q_halt) < self.config.halt_exploration_prob) * torch.randint_like(steps, low=2, high=self.config.halt_max_steps + 1)
                 halted = halted & (steps >= min_steps)
         return ModelCarry(inner, steps, halted, data, halt_counter=torch.zeros_like(steps)), out

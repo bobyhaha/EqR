@@ -94,7 +94,7 @@ def set_deterministic_mode(config, rank=0):
     os.environ['PYTHONHASHSEED'] = str(config.seed)
     
     if torch.cuda.is_available():
-        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
     os.environ['TORCHINDUCTOR_CACHE_DIR'] = os.path.join(os.getcwd(), '.torchinductor_cache')

@@ -2,6 +2,7 @@ from typing import Optional, Any, List, Dict
 from dataclasses import replace
 import os
 import math
+import inspect
 
 import multiprocessing as mp
 from multiprocessing.managers import SyncManager
@@ -352,9 +353,13 @@ def train_batch(
     current_epoch = (train_state.step - 1) // steps_per_epoch
 
 
-    model_forward_signatures = list(train_state.model.forward.__code__.co_varnames)
-    
-    if "compute_target_q" in model_forward_signatures:
+    model_forward_signature = inspect.signature(train_state.model.forward)
+    model_forward_params = model_forward_signature.parameters
+    accepts_compute_target_q = "compute_target_q" in model_forward_params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in model_forward_params.values()
+    )
+
+    if accepts_compute_target_q:
         compute_target_q = train_state.step % config.target_q_update_every == 0
         train_state.carry, loss, metrics, _, all_finish = train_state.model(
             carry=train_state.carry, batch=batch, return_keys=[], compute_target_q=compute_target_q

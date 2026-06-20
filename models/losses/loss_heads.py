@@ -15,6 +15,21 @@ def _carry_get(carry: Any, key: str, default: Any = None) -> Any:
     return getattr(carry, key, default)
 
 
+def _weighted_q_halt_precision_recall(
+    q_halt_logits: torch.Tensor,
+    seq_is_correct: torch.Tensor,
+    valid_metrics: torch.Tensor,
+    count: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    valid = valid_metrics.to(torch.bool)
+    pred_halt = q_halt_logits > 0
+    true_positive = (valid & pred_halt & seq_is_correct).to(torch.float32).sum()
+    precision = true_positive / (valid & pred_halt).to(torch.float32).sum().clamp_min(1)
+    recall = true_positive / (valid & seq_is_correct).to(torch.float32).sum().clamp_min(1)
+    count_f = count.to(torch.float32)
+    return precision * count_f, recall * count_f
+
+
 def _compute_z_alignment_per_sample(
     z_h: torch.Tensor,
     z_l: torch.Tensor,
@@ -188,6 +203,12 @@ class ACTLossHead(BaseLossHead):
             "raw_steps": torch.zeros_like(carry.steps, dtype=torch.float32),
         }
         if (count > 0).any():
+            q_halt_precision, q_halt_recall = _weighted_q_halt_precision_recall(
+                outputs["q_halt_logits"],
+                seq_is_correct,
+                valid_metrics,
+                count,
+            )
             metrics.update(
                 {
                     "accuracy": torch.where(
@@ -212,18 +233,8 @@ class ACTLossHead(BaseLossHead):
                         torch.full_like(loss_counts, float("inf"), dtype=torch.float32),
                     ).min(),
                     "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] > 0) == seq_is_correct)).sum(),
-                    "q_halt_precision": torch.where(
-                        valid_metrics,
-                        ((outputs["q_halt_logits"] > 0) & seq_is_correct).to(torch.float32).sum()
-                        / ((outputs["q_halt_logits"] >= 0).to(torch.float32).sum().clamp_min(1)),
-                        0,
-                    ).sum(),
-                    "q_halt_recall": torch.where(
-                        valid_metrics,
-                        ((outputs["q_halt_logits"] > 0) & seq_is_correct).to(torch.float32).sum()
-                        / (seq_is_correct.to(torch.float32).sum().clamp_min(1)),
-                        0,
-                    ).sum(),
+                    "q_halt_precision": q_halt_precision,
+                    "q_halt_recall": q_halt_recall,
                     "steps": torch.where(valid_metrics, carry.steps.to(torch.float32), 0).sum(),
                     "max_steps": torch.where(
                         valid_metrics,
@@ -335,6 +346,12 @@ class InferenceLossHead(ACTLossHead):
             forced_halt = (steps >= max_steps) if max_steps > 0 else carry.halted.to(device)
             valid_metrics = forced_halt & (loss_counts > 0)
             count = valid_metrics.sum()
+            q_halt_precision, q_halt_recall = _weighted_q_halt_precision_recall(
+                outputs["q_halt_logits"],
+                seq_is_correct,
+                valid_metrics,
+                count,
+            )
 
             metrics = {
                 "count": count,
@@ -346,18 +363,8 @@ class InferenceLossHead(ACTLossHead):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
                 **self._zh_zl_metrics(carry, count),
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] > 0) == seq_is_correct)).sum(),
-                "q_halt_precision": torch.where(
-                    valid_metrics,
-                    ((outputs["q_halt_logits"] > 0) & seq_is_correct).to(torch.float32).sum()
-                    / ((outputs["q_halt_logits"] >= 0).to(torch.float32).sum().clamp_min(1)),
-                    torch.zeros_like(loss_counts, dtype=torch.float32),
-                ).sum(),
-                "q_halt_recall": torch.where(
-                    valid_metrics,
-                    ((outputs["q_halt_logits"] > 0) & seq_is_correct).to(torch.float32).sum()
-                    / (seq_is_correct.to(torch.float32).sum().clamp_min(1)),
-                    torch.zeros_like(loss_counts, dtype=torch.float32),
-                ).sum(),
+                "q_halt_precision": q_halt_precision,
+                "q_halt_recall": q_halt_recall,
                 "steps": torch.where(valid_metrics, steps.to(torch.float32), torch.zeros_like(loss_counts, dtype=torch.float32)).sum(),
             }
 
